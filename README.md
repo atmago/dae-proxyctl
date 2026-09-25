@@ -1,30 +1,486 @@
 # proxyctl —— Linux 上基于 dae 的“按应用代理”管理工具
 
-proxyctl 让你在 Linux 上获得接近 Windows 下 Proxifier 的体验：遇到需要走代理的应用，
-一条命令（或在图形界面里点一下）就能把它加入代理名单，自动完成校验、生效和失败回滚。
+**只让你指定的程序走代理，其他程序一律直连。** 在图形界面里点一下，或者一条命令，就能把一个程序加入代理名单。
+
+proxyctl 的体验接近 Windows 上的 Proxifier：它负责管理 [dae](https://github.com/daeuniverse/dae) 的分流规则，
+每次修改都会自动校验、生效，出错时自动回滚，不会把你的网络配置改坏。
 
 > 目前只在 Ubuntu（GNOME 桌面）+ dae + v2rayN（xray 内核）的组合上实际使用过。
 > 其他发行版、桌面环境或代理核心（sing-box、mihomo）理论上可用，欢迎反馈问题。
 > 界面和输出目前只有中文。
 
-## 前提
+---
 
-* 已安装并配置好 [dae](https://github.com/daeuniverse/dae)，由 systemd 服务 `dae` 运行，配置文件为 `/etc/dae/config.dae`；
-* dae 的 `proxy` 组指向本机代理核心（xray / sing-box / mihomo，例如 v2rayN、Clash 系客户端）提供的 SOCKS5 端口；
-* Python 3（在 3.14 上测试）、curl、iproute2（ss）；图形界面需要 PyGObject + GTK 4（有 libadwaita 更好），也支持 GTK 3。
+## 目录
 
-## 原理
+* [它解决什么问题](#它解决什么问题)
+* [它是怎么工作的](#它是怎么工作的)
+* [安装前先确认](#安装前先确认)
+* [手把手安装教程](#手把手安装教程)
+  * [第 1 步：准备代理客户端（v2rayN）](#第-1-步准备代理客户端v2rayn)
+  * [第 2 步：安装 dae](#第-2-步安装-dae)
+  * [第 3 步：写 dae 配置文件](#第-3-步写-dae-配置文件)
+  * [第 4 步：启动 dae](#第-4-步启动-dae)
+  * [第 5 步：安装 proxyctl](#第-5-步安装-proxyctl)
+  * [第 6 步：自检](#第-6-步自检)
+  * [第 7 步：把第一个程序加入代理](#第-7-步把第一个程序加入代理)
+  * [第 8 步：开机自启（可选）](#第-8-步开机自启可选)
+* [日常使用](#日常使用)
+* [出问题时会怎样（故障模式）](#出问题时会怎样故障模式)
+* [常见问题](#常见问题)
+* [参考手册](#参考手册)（配置文件、全部命令、检查项、工作细节）
+* [卸载](#卸载)
+* [开发与测试](#开发与测试)
+
+---
+
+## 它解决什么问题
+
+在 Linux 上用代理，常见的做法有两种，各有麻烦：
+
+| 做法 | 问题 |
+|---|---|
+| **系统代理**（在系统设置里填代理地址） | 很多程序根本不看系统代理，例如 Signal、不少 Electron 应用、命令行工具。设置了也照样直连。 |
+| **TUN 模式 / 全局代理**（代理客户端接管整台电脑的流量） | 所有程序都进了代理：国内网站变慢，网银、炒股软件、公司 VPN 可能因为 IP 变化出问题，有些服务甚至会封号。 |
+
+你真正想要的往往是：**只有 Signal、Claude、ChatGPT 这几个程序走代理，其他全部直连**。
+
+Windows 上有 Proxifier 可以做到。Linux 上，[dae](https://github.com/daeuniverse/dae) 可以按**进程名**分流，
+能力足够，但需要手工编辑 `/etc/dae/config.dae`：写错一个字符 dae 就启动失败，而且不知道程序的进程名叫什么。
+
+proxyctl 就是 dae 的“遥控器”：
+
+* **看得到**：列出此刻正在联网的程序，告诉你它们叫什么、走的是代理还是直连；
+* **点一下**：选中程序加入代理名单，proxyctl 负责改配置、校验、让 dae 生效；
+* **改不坏**：每次修改前自动备份，校验不通过或 dae 出错就自动恢复原配置；
+* **有提醒**：dae 停了、代理断了、节点变慢时弹出桌面通知。
+
+## 它是怎么工作的
 
 ```
-应用 ──> dae（eBPF，按进程名 pname 匹配）──> proxy 组 ──> 本机 SOCKS5（如 127.0.0.1:10808）──> xray / sing-box / mihomo ──> 远程节点
-          └─ 未命中任何规则 ──> direct（直连）
+你的程序（Signal、Claude……）
+   │
+   ▼
+dae：在内核里看“这个连接是哪个程序发的”
+   ├─ 在代理名单里 ──> 本机代理客户端（v2rayN 等，127.0.0.1:10808）──> 远程节点 ──> 外网
+   └─ 不在名单里   ──> 直连
 ```
 
-* **dae 负责数据面**：内核里按进程名把流量分到 proxy 或 direct。不需要 TUN，也不需要系统代理。
-* **proxyctl 只做控制面**：它只编辑 `/etc/dae/config.dae` 里 `routing { }` 开头的三个管理区块，
-  然后校验、原子替换、`systemctl reload dae`。proxyctl 自己不拦截任何网络流量。
-* dae 的 routing 规则**从上到下，首条命中生效**，所以三个管理区块放在 routing 最前面，
-  并且顺序固定为：安全区块 → 直连保护 → 代理名单。
+分工很简单：
+
+* **代理客户端**（v2rayN / Clash 系客户端）负责连接你的节点，在本机开一个 SOCKS5 端口；
+* **dae** 负责分流：按进程名决定每个连接走代理还是直连。不需要 TUN，也不需要系统代理；
+* **proxyctl** 只负责管理 dae 的名单。它自己不碰任何网络流量。
+
+几个会反复出现的词：
+
+| 词 | 意思 |
+|---|---|
+| 进程名（pname） | 程序在系统里运行时的名字，例如 Signal 是 `signal-desktop`。dae 只认这个名字。 |
+| 代理名单 | 要走代理的进程名。 |
+| 直连保护 | 无论如何都必须直连的进程名，例如代理客户端自己、NetworkManager。 |
+| SOCKS5 地址 | 代理客户端在本机提供的代理入口，v2rayN 默认是 `127.0.0.1:10808`。 |
+
+## 安装前先确认
+
+| 要求 | 怎么确认 |
+|---|---|
+| **Linux 内核 5.17 或更高**（dae 的要求） | 执行 `uname -r`，例如 `6.8.0-45-generic` 就满足。Ubuntu 24.04 及以后、Debian 12 及以后的默认内核都满足。 |
+| **内核支持 BTF**（dae 的要求） | 执行 `ls /sys/kernel/btf/vmlinux`，能看到这个文件就行。主流发行版默认都有。 |
+| **使用 systemd 和 apt** | Ubuntu、Debian、Linux Mint 等。其他发行版也能用，但下面教程里的安装命令要自己换。 |
+| **一个能用的代理节点** | 本教程不涉及节点从哪里来。 |
+| **Python 3** | Ubuntu / Debian 自带。 |
+
+## 手把手安装教程
+
+下面每一步都在“终端”里执行（Ubuntu 里按 `Ctrl` + `Alt` + `T` 打开）。
+每个代码框是一条命令，复制进终端、回车即可。遇到 `sudo` 会要求输入你的登录密码，输入时屏幕上不显示字符，这是正常的。
+
+### 第 1 步：准备代理客户端（v2rayN）
+
+dae 自己不连接节点，它要把流量交给本机的代理客户端。这一步以 **v2rayN** 为例；如果你已经有能用的代理客户端，确认下面三点即可。
+
+1. 从 [v2rayN 的发布页](https://github.com/2dust/v2rayN/releases) 下载 Linux 版并安装，导入你的节点，选中一个节点。
+2. 在 v2rayN 的设置里找到“本地监听端口”（socks 端口），**记下这个端口号**，默认是 `10808`。
+3. **关闭 v2rayN 的“系统代理”和“TUN 模式”**：在 v2rayN 主界面底部把系统代理设为“清除系统代理”，TUN 开关保持关闭。
+   开着它们，所有程序都会被代理，按应用分流就失去了意义，还会干扰 proxyctl 的诊断。
+
+确认代理端口能用（把 `10808` 换成你的端口）：
+
+```bash
+curl -x socks5h://127.0.0.1:10808 https://ifconfig.me/ip; echo
+```
+
+应该显示一个**节点的 IP**，而不是你自己的 IP。如果报错，先在 v2rayN 里换个节点或检查端口，这一步不通，后面都不会通。
+
+> 为什么用 `ifconfig.me`：测试要找一个**直连和走代理都能打开**的网站，才能对比出口 IP。
+> 国内网络下 `api.ipify.org`、`https://1.1.1.1` 直连经常超时，不适合做对比；
+> 另外不要用 `http://`（不带 s）访问 1.1.1.1，它只会返回一个跳转页面，看起来像“没有输出”。
+
+> 用的是 Clash Verge、mihomo 或 sing-box 客户端？找到它的 SOCKS 端口或“混合端口（mixed-port）”，后面把 `10808` 都换成它。
+> 另外记下它的内核进程名：代理客户端启动后执行 `ss -ltnp | grep 你的端口`，括号里的 `(("xxx",...` 就是进程名，第 3 步要用。
+
+### 第 2 步：安装 dae
+
+dae 官方提供了 apt 软件源。这个源在国内有时打不开，所以下面的命令都**经过第 1 步的代理下载**（把 `10808` 换成你的端口），
+这样不管能不能直连都能装上。
+
+**2.1 添加 dae 软件源。** 先查看 apt 的版本：
+
+```bash
+apt --version
+```
+
+如果显示 `apt 3.x`（Ubuntu 25.04 及以后、Debian 13 及以后），执行：
+
+```bash
+sudo curl -x socks5h://127.0.0.1:10808 -fsSL -o /etc/apt/sources.list.d/daeuniverse.sources https://daeuniverse.pages.dev/daeuniverse.sources
+```
+
+如果显示 `apt 2.x`（Ubuntu 24.04、Debian 12 等），执行这一条：
+
+```bash
+sudo curl -x socks5h://127.0.0.1:10808 -fsSL -o /etc/apt/sources.list.d/daeuniverse.list https://daeuniverse.pages.dev/daeuniverse.list
+```
+
+**2.2 导入软件源的签名密钥**（apt 用它确认下载的软件没有被篡改）：
+
+```bash
+sudo curl -x socks5h://127.0.0.1:10808 -fsSL -o /usr/share/keyrings/daeuniverse-archive-goose.gpg https://daeuniverse.pages.dev/daeuniverse-archive-goose.gpg
+```
+
+**2.3 安装 dae**（`-o Acquire...` 这两段让 apt 也走代理）：
+
+```bash
+sudo apt -o Acquire::http::Proxy=socks5h://127.0.0.1:10808 -o Acquire::https::Proxy=socks5h://127.0.0.1:10808 update
+```
+
+```bash
+sudo apt -o Acquire::http::Proxy=socks5h://127.0.0.1:10808 -o Acquire::https::Proxy=socks5h://127.0.0.1:10808 install dae
+```
+
+装好后确认一下：
+
+```bash
+dae --version
+```
+
+能显示版本号（例如 `dae version v2.1.1`）就说明装好了。注意是 `dae --version`，写成 `dae version` 会报错。
+安装时会顺带装上 `v2ray-rules-dat`（分流用的规则数据），这是正常的。
+上面的命令来自 dae 官方的 [Linux 软件源说明](https://github.com/daeuniverse/repo-for-linux)，如有变化以官方为准。
+
+### 第 3 步：写 dae 配置文件
+
+dae 的配置文件是 `/etc/dae/config.dae`。用下面的命令打开编辑器（`nano` 是终端里的简单编辑器）：
+
+```bash
+sudo nano /etc/dae/config.dae
+```
+
+把下面的内容整段粘贴进去（在 nano 里用 `Ctrl` + `Shift` + `V` 粘贴）。
+**如果你的 SOCKS 端口不是 10808，改掉 `127.0.0.1:10808` 这一处；如果代理客户端的内核不是 xray，把 `pname(xray)` 换成第 1 步查到的进程名。**
+
+```
+global {
+    # 自动选择上网的网卡（有线 / Wi-Fi 都行）
+    wan_interface: auto
+    log_level: info
+    auto_config_kernel_parameter: true
+}
+
+node {
+    # 代理客户端提供的本地 SOCKS5 地址，按你的客户端修改端口
+    local: 'socks5://127.0.0.1:10808'
+}
+
+group {
+    proxy {
+        filter: name(local)
+        policy: fixed(0)
+    }
+}
+
+routing {
+    # 代理客户端的内核必须直连，否则会形成回环
+    pname(xray) -> must_direct
+
+    # 网络管理器保持直连
+    pname(NetworkManager) -> must_direct
+
+    # 其他所有程序默认直连
+    fallback: direct
+}
+```
+
+保存并退出：按 `Ctrl` + `O`，回车确认，再按 `Ctrl` + `X`。
+
+这份配置的意思是：dae 只认识一个出口 `local`（你的代理客户端），`proxy` 组就用它；
+路由规则里暂时**没有任何程序走代理**，全部直连。之后往名单里加程序的事交给 proxyctl。
+
+dae 要求配置文件只有 root 能读，否则拒绝启动。设置权限：
+
+```bash
+sudo chmod 600 /etc/dae/config.dae
+```
+
+检查配置有没有写错：
+
+```bash
+sudo dae validate -c /etc/dae/config.dae
+```
+
+没有任何输出就是正确的。如果报错，按提示回到编辑器修改，常见原因是粘贴时少了括号或引号。
+
+如果看到下面这样的报错，说明上一步的权限没设好，重新执行一次 `sudo chmod 600 /etc/dae/config.dae` 即可：
+
+```
+permissions 0644 for '/etc/dae/config.dae' are too open; ... suggest 0640 or 0600
+```
+
+### 第 4 步：启动 dae
+
+```bash
+sudo systemctl start dae
+```
+
+查看状态：
+
+```bash
+systemctl status dae --no-pager
+```
+
+看到绿色的 `active (running)` 就说明启动成功。这时打开几个网页，上网应该和之前完全一样，因为目前所有程序都是直连。
+
+再看一眼 dae 的日志：
+
+```bash
+sudo journalctl -u dae -n 30 --no-pager
+```
+
+正常情况下能看到类似这几行：
+
+```
+INFO Loading routing rules into kernel space (BPF)...
+INFO Bind to WAN: wlp3s0
+INFO Total startup time: 731.883537ms
+```
+
+`Bind to WAN:` 后面是你上网用的网卡（Wi-Fi 一般是 `wlp...` 或 `wlan0`，有线一般是 `enp...` 或 `eth0`）。
+如果显示 `failed`，同样看这份日志，最后几行会写明原因。
+
+不用担心 dae 把网络搞坏：随时可以执行 `sudo systemctl stop dae`，停止后所有程序立即恢复直连，不会残留任何设置。
+
+### 第 5 步：安装 proxyctl
+
+**5.1 安装依赖。** 这些都来自系统自带的软件源，不需要代理：
+
+```bash
+sudo apt install git curl iproute2 python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 libnotify-bin pkexec
+```
+
+其中 `python3-gi`、`gir1.2-gtk-4.0`、`gir1.2-adw-1` 用于图形界面，`libnotify-bin` 用于桌面通知，`pkexec` 用于在图形界面里弹出授权框。
+只用命令行的话，缺少它们也能用。
+
+**5.2 下载 proxyctl。** 访问 GitHub 如果不稳定，同样经过代理下载：
+
+```bash
+git -c http.proxy=socks5h://127.0.0.1:10808 clone https://github.com/atmago/dae-proxyctl.git
+```
+
+```bash
+cd dae-proxyctl
+```
+
+**5.3 运行安装脚本：**
+
+```bash
+sudo ./install.sh
+```
+
+安装脚本会：
+
+* 检查依赖，缺少必需的程序会直接停下，不做任何修改；
+* 把 `proxyctl` 装到 `/usr/local/bin/`，并在应用列表里添加“按应用代理（proxyctl）”图标；
+* 从 dae 配置里自动识别你的 SOCKS5 地址，写入 `/etc/proxyctl.conf`；
+* 在 dae 配置的 `routing { }` 开头加入 proxyctl 管理的三个区块，并把已有的 `pname` 规则迁移进去（改之前会自动备份）；
+* 设置 dae 异常退出时自动重启；
+* 安装一个每 15 秒运行一次的健康检查，出问题时弹出桌面通知。
+
+最后看到“安装完成”就成功了。脚本可以重复执行，重复执行不会产生重复内容。
+
+### 第 6 步：自检
+
+```bash
+proxyctl test
+```
+
+它会真正发几次请求来验证整条链路：
+
+1. 直接经过 SOCKS5 访问，得到节点的出口 IP：确认代理客户端能用；
+2. 用一个名字在代理名单里的测试程序访问：出口 IP 应该**等于**节点 IP，说明 dae 的分流生效了；
+3. 用一个不在任何名单里的测试程序访问：出口 IP 应该**不等于**节点 IP，说明其他程序确实直连；
+4. 连续新建 5 个代理连接并计时，检查节点是否太慢；
+5. 检查有没有开着 TUN 网卡。
+
+前 3 项都是 PASS 就说明一切正常。某一项失败时，输出里会用中文说明原因和处理办法。
+
+再做一次完整的健康检查：
+
+```bash
+sudo proxyctl check
+```
+
+每一项会显示 OK / WARN / FAIL。WARN 是提醒，不影响使用；FAIL 需要处理，输出里会说明怎么做。
+
+### 第 7 步：把第一个程序加入代理
+
+以 Signal 为例，其他程序同理。
+
+**用图形界面（推荐）：**
+
+1. 先打开 Signal，让它联网一下（登录、刷新都行）；
+2. 在应用列表里打开“**按应用代理（proxyctl）**”；
+3. 在“联网进程”页找到 `signal-desktop`，点“**加入代理**”，输入密码授权；
+4. 底部提示成功后，Signal 会在几十秒内自动重连，之后就走代理了。
+
+**用命令行：**
+
+```bash
+proxyctl list
+```
+
+它会列出正在联网的程序和它们的进程名，找到要代理的那个，然后：
+
+```bash
+proxyctl add signal-desktop
+```
+
+也可以用 `proxyctl pick`：列出程序后直接输入编号加入。
+
+**进程名不一定是程序的名字。** 桌面图标上写的是“Signal”，进程名却是 `signal-desktop`。
+proxyctl 的列表里显示的就是进程名；也可以打开程序后自己查（把 `signal` 换成程序名里的关键词）：
+
+```bash
+ps -eo pid,comm,args | grep -i signal | grep -v grep
+```
+
+第二列（`comm`）就是进程名。Signal 这类 Electron 程序会有很多个进程，但在 Linux 上它们的名字通常都一样，加一个就够了。
+
+**加入后还是连不上？** 很多程序真正联网的是名字不同的子进程。
+例如 ChatGPT 桌面版的登录由子进程 `codex` 完成，只加入 `ChatGPT` 会被提示地区不支持。
+proxyctl 会把这类进程显示为“**未代理子进程**”，把它也加入即可。详见[常见问题](#常见问题)。
+
+**Signal 这类“代理不可用时绝不能启动”的程序**，可以加一个启动守卫：
+dae 或代理没准备好时，点图标会拒绝启动并弹出提示，防止它直连。执行（不要加 sudo）：
+
+```bash
+proxyctl guard-desktop signal-desktop.desktop
+```
+
+### 第 8 步：开机自启（可选）
+
+安装脚本**不会**替你设置 dae 开机自启，要不要自启由你决定。
+建议先用几天，把常用的程序都加进名单、确认都正常后再开启。需要的话：
+
+```bash
+sudo systemctl enable dae
+```
+
+代理客户端也要设成登录后自动启动（v2rayN 在设置里勾选“开机启动”）。
+开机时 dae 会比 v2rayN 先启动，这段时间名单里的程序连不上外网，但不会直连泄露；登录、v2rayN 启动后会自动恢复。
+
+**请注意**：如果 dae 没有运行，名单里的程序会**直接连外网**（见下面的“故障模式”）。
+设置了开机自启，再配合启动守卫和健康检查通知，就能避免这种情况。
+
+## 日常使用
+
+大部分时候只需要打开图形界面“按应用代理（proxyctl）”：
+
+* **顶部状态卡**：一句话告诉你代理是否正常，出问题时变色并给出处理建议；
+* **联网进程页**：按“需要注意 / 代理中 / 直连 / 最近断开”分组，一键加入代理、直连保护或移除，`Ctrl` + `F` 搜索；
+* **规则页**：查看和管理代理名单、直连保护名单，也可以手动输入进程名添加；
+* **右上角**：运行自检。
+
+常用命令：
+
+| 想做的事 | 命令 |
+|---|---|
+| 看哪些程序在联网、走的是哪条路 | `proxyctl list` |
+| 把程序加入代理 | `proxyctl add <进程名>` 或 `proxyctl pick` |
+| 把程序移出代理 | `proxyctl remove <进程名>` |
+| 查看当前名单 | `proxyctl rules` |
+| 代理好像不通了 | `proxyctl test`，然后 `sudo proxyctl check` |
+| 改坏了想恢复 | `sudo proxyctl backups`，然后 `sudo proxyctl restore <备份名>` |
+
+**每次修改名单，dae 都会重新加载，正在走代理的连接会断开一下**，程序一般会自动重连；Signal 重连较慢，可能要 1～2 分钟。
+
+## 出问题时会怎样（故障模式）
+
+| 情况 | 结果 | 说明 |
+|---|---|---|
+| **dae 停止**（崩溃、被停止、开机未启动） | **故障即放行** | 没有任何进程被拦截，名单中的程序会**直接连接外网**，暴露真实 IP。check 会报 FAIL，定时器最迟约 15 秒内弹通知、恢复时再通知；`proxyctl run` / guard-desktop 会阻止被守卫的程序启动（但无法影响已在运行的程序）。 |
+| **xray / v2rayN 停止**，或节点不可用 | **故障即断开** | dae 仍然把名单程序送进 proxy 组，但 SOCKS5 不通，这些程序无法联网，不会泄露。xray 在运行但连不上节点时，链路探测会在约 2～3 分钟内报警。 |
+| 新配置未通过 validate | 不生效 | 原配置不变。 |
+| reload 失败，或 reload 后 dae 退出 | 自动回滚 | 恢复原配置并再次 reload；若 dae 仍未恢复，会提示 `sudo systemctl restart dae`。drop-in 的 `Restart=on-failure` 也会让 systemd 尝试重启 dae。 |
+| 节点很慢（高峰期拥堵、线路限速） | 能用但很卡 | 经代理每个新连接要好几秒。Claude 这类一次性请求还能用，Signal 这类长连接会反复显示离线。链路探测连续 3 次超过 3 秒会提醒“代理很慢”，在 v2rayN 中更换节点即可。 |
+| 修改名单（add / remove / protect / unprotect / restore） | 短暂断线 | dae 重新加载会断开所有正在走代理的连接，程序会自动重连；Signal 重连较慢，可能离线几十秒到 1～2 分钟。命令输出和 GUI 对话框会提示这一点。 |
+| 应用改名 / 同名程序 | 规则按名字匹配 | pname 只看进程名，改名即可绕过；同名的其他程序也会被代理。这是 dae pname 的固有性质。 |
+
+## 常见问题
+
+**加入名单后应用还是直连？**
+先 `proxyctl test` 看链路是否正常，再 `sudo journalctl -u dae -f` 看该应用实际的 pname。
+很多应用真正联网的是子进程（例如 `xxx-helper`、`WebKitNetworkProcess`），要加入的是子进程的名字。
+另外已经建立的长连接不会被重新分流，重启应用即可。
+
+**为什么不能 add python3 / node / java / curl？**
+dae 只按名字匹配，加入 `python3` 会把电脑上所有 Python 程序（例如量化交易程序）一起送进代理。
+这类程序请在程序自己的设置里配置 SOCKS5 代理，或者设置环境变量，例如 `ALL_PROXY=socks5h://127.0.0.1:10808`。
+完整列表见[进程名规则](#进程名规则)。（init 时如果旧配置里已有这类名字，会原样迁移并给出警告，建议 `proxyctl remove`。）
+
+**非 root 时 list / rules 显示“未知”或“来自缓存”？**
+`/etc/dae/config.dae` 必须是 0600/0640，普通用户读不到。proxyctl 每次以 root 修改或检查配置时，
+会把名单（只有进程名）写入 `/var/lib/proxyctl/rules.json`（0644），非 root 命令和 GUI 读取这个缓存。
+另外非 root 时 ss 只能看到当前用户自己的进程。
+
+**重启后名单程序都连不上？**
+先运行 `proxyctl test`（**不要先开 v2rayN 的 TUN 模式**：TUN 与 dae 同时开会互相叠加，名单被绕过，诊断也会被干扰）。
+第 1 步就 FAIL 说明 xray 连不上节点，在 v2rayN 中测试或更换节点；第 1 步 PASS、第 2 步 FAIL 才是 dae 的问题。
+开机时 dae 会比 v2rayN（登录后自启）早启动，这段时间名单程序连不上是正常的（故障即断开），登录后会自动恢复。
+
+**Signal 显示离线，但 `proxyctl test` 全部通过？**
+先看是不是节点太慢：`proxyctl check --basic` 或 GUI 顶栏的“链路”会显示每次探测的耗时，正常应在 1 秒左右。
+如果要好几秒，在 v2rayN 中测试延迟并更换节点，然后从托盘退出 Signal 再重新打开。
+刚修改过名单、刚重启过 v2rayN 或 dae 时，Signal 也会离线一会儿，等 1～2 分钟或重开 Signal 即可。
+
+**Claude 反复显示 "Request failed · Retrying"，但 v2rayN 里节点延迟只有几百毫秒？**
+看 `proxyctl test` 的第 4 项：它连续新开 5 条代理连接并计时，中位超过 1.5 秒（`connect_slow`）就给出 WARN。
+v2rayN 的延迟测试反映的是已建好连接上的一次请求，“新建连接很慢”时它照样显示几百毫秒，浏览网页也感觉不到；
+但 Claude 这类频繁新开连接的应用会反复超时。解决办法：在 v2rayN 中双击当前节点，开启“Mux 多路复用”，再点“重启服务”
+（v2rayN 7.x 的 Mux 开关跟着节点走，换节点后要重新开；设置页里的“sing-box Mux 协议”对 xray 内核无效）。
+第 5 项检测到 TUN 网卡时也会给出 WARN，请关闭 v2rayN 的 TUN 模式。警告不影响 test 的退出码。
+
+**我的代理客户端端口不是 10808，要改哪里？**
+两处要一致：dae 配置里 `node` 段的 socks5 地址，以及 `/etc/proxyctl.conf` 里的 `socks = `（安装时会自动识别，一般不用手改）。
+`sudo proxyctl check` 发现两者不一致时会给出警告。
+
+**IPv6？**
+如果 check 提示有全局 IPv6 地址，请用 `/usr/local/lib/proxyctl/proxyctl-probe -6 -sS https://ifconfig.me/ip`
+单独测试 IPv6 流量是否也走了代理。
+
+**DNS 会泄露吗？**
+proxyctl 不做任何 DNS 相关修改（不改 dial_mode，不加 dns 段），`check` 只显示现状。请根据 dae 文档自行决定。
+注意不要把 dae 的 `dial_mode: domain` 简单等同于 Proxifier 的“远程 DNS”，两者机制并不相同，对 DNS 有严格要求时请单独测试。
+
+**如何回到安装前的配置？**
+`sudo proxyctl backups` 找到最早的 `*-init.dae`，然后 `sudo proxyctl restore <它>`。
+
+## 参考手册
+
+### 配置结构
+
+proxyctl 只编辑 `/etc/dae/config.dae` 里 `routing { }` 开头的三个管理区块。dae 的 routing 规则**从上到下，首条命中生效**，
+所以三个区块放在 routing 最前面，顺序固定为：安全区块 → 直连保护 → 代理名单。
 
 ```
 routing {
@@ -49,6 +505,9 @@ routing {
 管理区块之外的所有内容（global、node、group、dns、其他 routing 规则、注释、空行）
 proxyctl 都逐字节原样保留。请不要手工编辑管理区块内部；如果标记被破坏，proxyctl 会拒绝修改。
 
+如果你的代理核心进程名不在安全区块里（例如某些客户端把 mihomo 改名为 `verge-mihomo`），
+用 `proxyctl protect <进程名>` 把它加入直连保护。
+
 ### 每次写配置都是一个事务
 
 1. 加文件锁（`/var/lib/proxyctl/lock`），防止两个 proxyctl 同时修改；
@@ -59,20 +518,12 @@ proxyctl 都逐字节原样保留。请不要手工编辑管理区块内部；�
 6. 若 dae 正在运行，`systemctl reload dae`，然后确认 `systemctl is-active dae` 仍是 active；
 7. 任何一步失败都自动恢复原配置（如果已经 reload，会再 reload 一次），并给出中文说明。
 
-## 安装
-
-```bash
-git clone https://github.com/atmago/dae-proxyctl.git
-cd dae-proxyctl
-sudo ./install.sh
-```
-
-install.sh 会（可重复执行）：
+### install.sh 安装了什么
 
 * 检查依赖：python3、dae、curl、ss、systemctl（必需）；notify-send、pkexec、PyGObject（可选，缺少只警告）；
 * 安装 `/usr/local/bin/proxyctl`；把 curl 复制为 `/usr/local/lib/proxyctl/proxyctl-probe` 和 `proxyctl-direct`；
 * 创建 `/var/lib/proxyctl/backups`（0700）；
-* 创建配置文件 `/etc/proxyctl.conf`（已存在则不动），并从 dae 配置中识别 SOCKS5 节点地址填入（见下文“配置”）；
+* 创建配置文件 `/etc/proxyctl.conf`（已存在则不动），并从 dae 配置中识别 SOCKS5 节点地址填入；
 * 安装图形界面启动器 `/usr/share/applications/proxyctl.desktop`；
 * 创建 systemd drop-in `/etc/systemd/system/dae.service.d/proxyctl.conf`（`Restart=on-failure`）并 `daemon-reload`，
   不改动 `/usr/lib` 下的原服务文件；
@@ -81,22 +532,7 @@ install.sh 会（可重复执行）：
   恢复正常时再弹一条“已恢复”通知；
 * 执行 `proxyctl init`。
 
-install.sh **不会** 执行 `systemctl enable dae`，是否开机自启由你决定。
-
-安装后依次执行：
-
-```bash
-proxyctl test
-```
-
-```bash
-sudo proxyctl check
-```
-
-卸载：`sudo ./uninstall.sh`。卸载不会删除管理区块里的规则，也不会删除备份。
-如需还原配置，在卸载前执行 `sudo proxyctl restore <备份名>`（最早的 `*-init.dae` 就是 init 之前的原始配置）。
-
-## 配置
+### 配置文件 /etc/proxyctl.conf
 
 proxyctl 的设置写在 `/etc/proxyctl.conf`（`键 = 值`，`#` 开头为注释），修改后立即生效，GUI 和健康检查定时器也会读取。
 最常需要改的是 **SOCKS5 地址**：proxyctl 用它检查代理端口、探测链路和做 `test`，必须与 dae 配置中的 socks5 节点一致。
@@ -122,9 +558,8 @@ socks = 127.0.0.1:7891
 
 同名环境变量 `PROXYCTL_<大写键名>`（例如 `PROXYCTL_SOCKS`）优先于配置文件，但 sudo、pkexec 和 systemd 定时器不会传递环境变量，
 日常使用请改配置文件。配置文件必须属于 root 且不能被其他用户写入，否则会被忽略。
-`sudo proxyctl check` 发现 proxyctl 的 SOCKS 地址与 dae 配置中的 socks5 节点不一致时会给出警告。
 
-## 命令
+### 全部命令
 
 需要 root 的命令（init、add、remove、protect、unprotect、restore）在终端里以普通用户运行时，
 会自动通过 sudo 重新执行自身；在图形界面里则通过 pkexec 弹出授权框。
@@ -145,7 +580,7 @@ socks = 127.0.0.1:7891
 | `proxyctl guard-desktop <x.desktop> [--undo]` | 在 `~/.local/share/applications/` 生成启动器覆盖副本，让它经 `proxyctl run --wait 30 --` 启动。不需要 root，不要加 sudo。 |
 | `proxyctl backups` | 列出配置备份。 |
 | `proxyctl restore <备份名>` | 恢复备份（同样经过 validate / reload / 回滚流程）。 |
-| `proxyctl gui` | 启动图形界面：顶部状态卡用一句话说明代理是否正常（dae / SOCKS / 代理核心 / 链路四项细节），出问题时变色并给出处理建议；“联网进程”页按“需要注意 / 代理中 / 直连 / 最近断开”分组，可筛选（Ctrl+F）并一键加入代理、直连保护或移除；“规则”页管理名单；右上角可运行自检。所有修改通过 pkexec 授权执行，成功后底部弹出提示，失败才弹窗。安装了 libadwaita（gir1.2-adw-1）时界面跟随系统深浅色和强调色。 |
+| `proxyctl gui` | 启动图形界面。所有修改通过 pkexec 授权执行，成功后底部弹出提示，失败才弹窗。安装了 libadwaita（gir1.2-adw-1）时界面跟随系统深浅色和强调色。 |
 
 ### 进程名规则
 
@@ -157,35 +592,17 @@ socks = 127.0.0.1:7891
   ssh、curl、wget、git。因为 pname 只按名字匹配，加入 python3 会把所有 Python 程序（例如量化交易程序）
   一起送进代理。这类程序请使用它自身的代理设置，例如 `ALL_PROXY=socks5h://127.0.0.1:10808`（换成你的 SOCKS 地址）。
 
-### check 检查项
+### 添加新应用的完整流程
 
-* dae 服务是否 active（未运行时用醒目的 FAIL 提示：名单中的程序此刻会直连外网）；
-* SOCKS5 端口（默认 127.0.0.1:10808）是否在监听、由哪个进程监听；xray / sing-box / mihomo 是否在运行；
-* **代理链路**：真正经 SOCKS5 访问一次 `https://www.gstatic.com/generate_204`（超时 15 秒），
-  确认 xray → 节点 → 外网整条链路可用。dae、端口、xray 都正常但节点不通时，只有这一项能发现。
-  连续 2 次失败才报 FAIL（节点偶发抖动只报 WARN）；连续 3 次都能通但每次超过 3 秒（`PROXYCTL_SLOW_SECONDS`），
-  报 WARN“代理链路很慢”并弹一条普通通知（30 分钟内只提醒一次）——节点很慢时 Signal 会反复显示离线，
-  而其他检查全部正常；
-* 配置文件权限（root 所有、0600/0640）、能否读取、是否通过 `dae validate`、安全区块是否完整；
-* 代理名单中是否有通用运行时名称、是否有超过 15 个字符的名字；
-* dae 服务的 Restart 策略（不是 on-failure 时提示）；
-* 默认路由接口（以及配置项 `iface` 中的接口）是否有全局 IPv6 地址（有则提醒单独测试 IPv6）；
-* proxyctl 的 SOCKS 地址是否与 dae 配置中的 socks5 节点一致；
-* 当前 dial_mode、是否存在 systemd-resolve 的 must_direct 规则（仅展示，proxyctl 不做任何 DNS 决策）。
-
-非 root 运行时读不到配置，这些项会显示为 SKIP，并提示用 `sudo proxyctl check` 获得完整检查。
-`--quiet` 只输出 WARN/FAIL；`--notify` 在有 FAIL 时调用 notify-send；`--basic` 只检查 dae、端口、代理核心和代理链路。
-定时器每 15 秒运行一次 `--basic`：链路正常时每 2 分钟才真正探测一次（`PROXYCTL_CHAIN_INTERVAL`），
-探测失败后每 15 秒复查，以便尽快确认故障或恢复。GUI 顶栏的“链路”指示灯读取定时器的结果，自己不发请求。
-
-### test 自检
-
-1. `curl -x socks5h://<SOCKS 地址> https://ifconfig.me/ip` → 得到代理出口 IP；
-2. 运行 `proxyctl-probe`（curl 副本，进程名命中安全区块里的 proxy 规则），不设任何代理 → 应等于代理 IP；
-3. 运行 `proxyctl-direct`（curl 副本，不在任何规则中）→ 应不等于代理 IP（默认直连）。
-
-所有请求都带 `--max-time 10`，并清除 `*_proxy` 环境变量。每个请求失败时最多尝试 3 次（`PROXYCTL_TEST_RETRIES`），
-避免节点偶发抖动造成误报；重试后才成功时会注明“第 N 次尝试才成功”。如果经常看到这句提示，说明节点不稳定。
+1. 打开应用，让它联网（例如登录、刷新一下）。
+2. 执行 `proxyctl list`（或在 GUI 的“联网进程”标签页）找到它的进程名。
+   Electron / Chromium 类应用可能有多个进程，名字不一定和启动命令相同。
+   加入后再看一次 `list`：如果出现该应用的“未代理子进程”，而应用仍有地区限制或连不上，把子进程也加入。
+3. `proxyctl add <进程名>`（或 `proxyctl pick`，或在 GUI 里点“加入代理”）。
+4. 用 `sudo journalctl -u dae -f` 观察这个应用的连接，确认 `pname` 与名单一致、出口是 proxy。
+   如果日志里显示的名字不同，`proxyctl remove` 旧名字，再 `add` 日志中的名字。
+5. 对于“代理不可用时绝不能启动”的应用（例如 Signal：在无代理时启动可能导致设备被解除关联），加启动守卫：
+   `proxyctl guard-desktop signal-desktop.desktop`。
 
 ### 未代理子进程
 
@@ -199,75 +616,64 @@ pname 只按进程名匹配。代理名单中的程序如果启动了**名字不
 通用运行时名称（bash、python3 等）不能加入代理名单，所以不会列出；列出的进程也不一定需要联网，
 只在该应用出现地区限制或连接失败时再加入即可。
 
-GUI 的“联网进程”表还会把最近 5 分钟内出现过外网连接、现已断开的进程以灰色保留（`PROXYCTL_GUI_RECENT` 秒数可调），
+GUI 的“联网进程”表还会把最近 5 分钟内出现过外网连接、现已断开的进程以灰色保留（`gui_recent` 秒数可调），
 便于发现一闪而过的短连接。
 
-## 添加新应用的标准流程
+### check 检查项
 
-1. 打开应用，让它联网（例如登录、刷新一下）。
-2. 执行 `proxyctl list`（或在 GUI 的“联网进程”标签页）找到它的进程名。
-   Electron / Chromium 类应用可能有多个进程，名字不一定和启动命令相同。
-   加入后再看一次 `list`：如果出现该应用的“未代理子进程”，而应用仍有地区限制或连不上，把子进程也加入。
-3. `proxyctl add <进程名>`（或 `proxyctl pick`，或在 GUI 里点“加入代理”）。
-4. 用 `sudo journalctl -u dae -f` 观察这个应用的连接，确认 `pname` 与名单一致、出口是 proxy。
-   如果日志里显示的名字不同，`proxyctl remove` 旧名字，再 `add` 日志中的名字。
-5. 对于“代理不可用时绝不能启动”的应用（例如 Signal：在无代理时启动可能导致设备被解除关联），加启动守卫：
-   `proxyctl guard-desktop signal-desktop.desktop`。
+* dae 服务是否 active（未运行时用醒目的 FAIL 提示：名单中的程序此刻会直连外网）；
+* SOCKS5 端口（默认 127.0.0.1:10808）是否在监听、由哪个进程监听；xray / sing-box / mihomo 是否在运行；
+* **代理链路**：真正经 SOCKS5 访问一次 `https://www.gstatic.com/generate_204`（超时 15 秒），
+  确认 xray → 节点 → 外网整条链路可用。dae、端口、xray 都正常但节点不通时，只有这一项能发现。
+  连续 2 次失败才报 FAIL（节点偶发抖动只报 WARN）；连续 3 次都能通但每次超过 3 秒（`slow_seconds`），
+  报 WARN“代理链路很慢”并弹一条普通通知（30 分钟内只提醒一次）——节点很慢时 Signal 会反复显示离线，
+  而其他检查全部正常；
+* 配置文件权限（root 所有、0600/0640）、能否读取、是否通过 `dae validate`、安全区块是否完整；
+* 代理名单中是否有通用运行时名称、是否有超过 15 个字符的名字；
+* dae 服务的 Restart 策略（不是 on-failure 时提示）；
+* 默认路由接口（以及配置项 `iface` 中的接口）是否有全局 IPv6 地址（有则提醒单独测试 IPv6）；
+* proxyctl 的 SOCKS 地址是否与 dae 配置中的 socks5 节点一致；
+* 当前 dial_mode、是否存在 systemd-resolve 的 must_direct 规则（仅展示，proxyctl 不做任何 DNS 决策）。
 
-## 故障模式
+非 root 运行时读不到配置，这些项会显示为 SKIP，并提示用 `sudo proxyctl check` 获得完整检查。
+`--quiet` 只输出 WARN/FAIL；`--notify` 在有 FAIL 时调用 notify-send；`--basic` 只检查 dae、端口、代理核心和代理链路。
+定时器每 15 秒运行一次 `--basic`：链路正常时每 2 分钟才真正探测一次（`chain_interval`），
+探测失败后每 15 秒复查，以便尽快确认故障或恢复。GUI 顶栏的“链路”指示灯读取定时器的结果，自己不发请求。
 
-| 情况 | 结果 | 说明 |
-|---|---|---|
-| **dae 停止**（崩溃、被停止、开机未启动） | **故障即放行** | 没有任何进程被拦截，名单中的程序会**直接连接外网**，暴露真实 IP。check 会报 FAIL，定时器最迟约 15 秒内弹通知、恢复时再通知；`proxyctl run` / guard-desktop 会阻止被守卫的程序启动（但无法影响已在运行的程序）。 |
-| **xray / v2rayN 停止**，或节点不可用 | **故障即断开** | dae 仍然把名单程序送进 proxy 组，但 SOCKS5 不通，这些程序无法联网，不会泄露。xray 在运行但连不上节点时，链路探测会在约 2～3 分钟内报警。 |
-| 新配置未通过 validate | 不生效 | 原配置不变。 |
-| reload 失败，或 reload 后 dae 退出 | 自动回滚 | 恢复原配置并再次 reload；若 dae 仍未恢复，会提示 `sudo systemctl restart dae`。drop-in 的 `Restart=on-failure` 也会让 systemd 尝试重启 dae。 |
-| 节点很慢（高峰期拥堵、线路限速） | 能用但很卡 | 经代理每个新连接要好几秒。Claude 这类一次性请求还能用，Signal 这类长连接会反复显示离线。链路探测连续 3 次超过 3 秒会提醒“代理很慢”，在 v2rayN 中更换节点即可。 |
-| 修改名单（add / remove / protect / unprotect / restore） | 短暂断线 | dae 重新加载会断开所有正在走代理的连接，程序会自动重连；Signal 重连较慢，可能离线几十秒到 1～2 分钟。命令输出和 GUI 对话框会提示这一点。 |
-| 应用改名 / 同名程序 | 规则按名字匹配 | pname 只看进程名，改名即可绕过；同名的其他程序也会被代理。这是 dae pname 的固有性质。 |
+### test 自检
 
-## 常见问题
+1. `curl -x socks5h://<SOCKS 地址> https://ifconfig.me/ip` → 得到代理出口 IP；
+2. 运行 `proxyctl-probe`（curl 副本，进程名命中安全区块里的 proxy 规则），不设任何代理 → 应等于代理 IP；
+3. 运行 `proxyctl-direct`（curl 副本，不在任何规则中）→ 应不等于代理 IP（默认直连）；
+4. 连续新开 5 条代理连接并计时，中位超过 `connect_slow` 秒给出 WARN；
+5. 检测 TUN 网卡，存在时给出 WARN。
 
-**加入名单后应用还是直连？**
-先 `proxyctl test` 看链路是否正常，再 `sudo journalctl -u dae -f` 看该应用实际的 pname。
-很多应用真正联网的是子进程（例如 `xxx-helper`、`WebKitNetworkProcess`），要加入的是子进程的名字。
-另外已经建立的长连接不会被重新分流，重启应用即可。
+所有请求都带 `--max-time 10`，并清除 `*_proxy` 环境变量。每个请求失败时最多尝试 3 次（`test_retries`），
+避免节点偶发抖动造成误报；重试后才成功时会注明“第 N 次尝试才成功”。如果经常看到这句提示，说明节点不稳定。
+第 4、5 项的警告不影响退出码。
 
-**为什么不能 add python3 / node / java / curl？**
-见上文“通用运行时名称”。请在这些程序里配置 SOCKS5 代理，或者设置环境变量。
-（init 时如果旧配置里已有这类名字，会原样迁移并给出警告，建议 `proxyctl remove`。）
+## 卸载
 
-**非 root 时 list / rules 显示“未知”或“来自缓存”？**
-`/etc/dae/config.dae` 必须是 0600/0640，普通用户读不到。proxyctl 每次以 root 修改或检查配置时，
-会把名单（只有进程名）写入 `/var/lib/proxyctl/rules.json`（0644），非 root 命令和 GUI 读取这个缓存。
-另外非 root 时 ss 只能看到当前用户自己的进程。
+**只卸载 proxyctl：**
 
-**重启后名单程序都连不上？**
-先运行 `proxyctl test`（**不要先开 v2rayN 的 TUN 模式**：TUN 与 dae 同时开会互相叠加，名单被绕过，诊断也会被干扰）。
-第 1 步就 FAIL 说明 xray 连不上节点，在 v2rayN 中测试或更换节点；第 1 步 PASS、第 2 步 FAIL 才是 dae 的问题。
-开机时 dae 会比 v2rayN（登录后自启）早启动，这段时间名单程序连不上是正常的（故障即断开），登录后会自动恢复。
+```bash
+sudo ./uninstall.sh
+```
 
-**Signal 显示离线，但 `proxyctl test` 全部通过？**
-先看是不是节点太慢：`proxyctl check --basic` 或 GUI 顶栏的“链路”会显示每次探测的耗时，正常应在 1 秒左右。
-如果要好几秒，在 v2rayN 中测试延迟并更换节点，然后从托盘退出 Signal 再重新打开。
-刚修改过名单、刚重启过 v2rayN 或 dae 时，Signal 也会离线一会儿，等 1～2 分钟或重开 Signal 即可。
+卸载不会删除管理区块里的规则，也不会删除备份，dae 会继续按现有名单分流。
+如需还原配置，在卸载前执行 `sudo proxyctl restore <备份名>`（最早的 `*-init.dae` 就是 init 之前的原始配置）。
 
-**Claude 反复显示 "Request failed · Retrying"，但 v2rayN 里节点延迟只有几百毫秒？**
-看 `proxyctl test` 的第 4 项：它连续新开 5 条代理连接并计时，中位超过 1.5 秒（`PROXYCTL_CONNECT_SLOW`）就给出 WARN。
-v2rayN 的延迟测试反映的是已建好连接上的一次请求，“新建连接很慢”时它照样显示几百毫秒，浏览网页也感觉不到；
-但 Claude 这类频繁新开连接的应用会反复超时。解决办法：在 v2rayN 中双击当前节点，开启“Mux 多路复用”，再点“重启服务”
-（v2rayN 7.x 的 Mux 开关跟着节点走，换节点后要重新开；设置页里的“sing-box Mux 协议”对 xray 内核无效）。
-第 5 项检测到 TUN 网卡时也会给出 WARN，请关闭 v2rayN 的 TUN 模式。警告不影响 test 的退出码。
+**连 dae 一起卸载：**
 
-**IPv6？**
-如果 check 提示有全局 IPv6 地址，请用 `/usr/local/lib/proxyctl/proxyctl-probe -6 -sS https://ifconfig.me/ip`
-单独测试 IPv6 流量是否也走了代理。
+```bash
+sudo systemctl disable --now dae
+```
 
-**DNS 会泄露吗？**
-proxyctl 不做任何 DNS 相关修改（不改 dial_mode，不加 dns 段），`check` 只显示现状。请根据 dae 文档自行决定。
+```bash
+sudo apt remove dae
+```
 
-**如何回到安装前的配置？**
-`sudo proxyctl backups` 找到最早的 `*-init.dae`，然后 `sudo proxyctl restore <它>`。
+停止 dae 后，所有程序都恢复直连。
 
 ## 开发与测试
 
