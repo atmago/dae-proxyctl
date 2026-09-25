@@ -1,0 +1,18 @@
+udp ESTAB      0      0                          192.168.1.10%eth0:68               192.168.1.1:67
+udp ESTAB      0      0                                     127.0.0.1:51062               127.0.0.1:10808
+tcp ESTAB      0      0                                     127.0.0.1:10808               127.0.0.1:59664 users:(("xray",pid=66511,fd=49))
+tcp ESTAB      0      0                                 192.168.1.10:33386           34.54.194.141:443   users:(("claude-desktop",pid=74886,fd=31))
+tcp SYN-SENT   0      1                                 192.168.1.10:58698           172.217.114.4:443   users:(("chrome",pid=5725,fd=53))
+tcp SYN-SENT   0      1                                 192.168.1.10:58712           172.217.114.4:443   users:(("chrome",pid=5725,fd=54))
+tcp ESTAB      0      0                                 192.168.1.10:55196         22.33.44.55:443   users:(("signal-desktop",pid=61718,fd=43))
+tcp ESTAB      0      0                                 192.168.1.10:33858          11.22.33.44:8443  users:(("xray",pid=66511,fd=34))
+tcp ESTAB      0      0                                 192.168.1.10:34710          11.22.33.44:8443  users:(("xray",pid=66511,fd=44))
+tcp ESTAB      0      0        [2001:db8:1:1::c]:41234  [2001:4860:4840:400::]:443  users:(("chrome",pid=5726,fd=12))
+tcp ESTAB      0      0                            [::ffff:192.168.1.10]:5555  [::ffff:8.8.4.4]:443  users:(("java",pid=900,fd=3),("java",pid=901,fd=3))
+tcp ESTAB      0      0                            [::1]:6000                   [::1]:6001   users:(("loop6",pid=1,fd=3))
+tcp ESTAB      0      0                            [fe80::1%eth0]:6000        [fe80::2%eth0]:22   users:(("sshd",pid=2,fd=3))
+tcp ESTAB      0      0                            [fd1f:ba5e::1]:6000          [fd1f:ba5e::2]:22   users:(("ula",pid=3,fd=3))
+tcp ESTAB      0      0                                 10.0.0.5:5000              10.0.0.9:443   users:(("lanapp",pid=4,fd=3))
+tcp ESTAB      0      0                                 192.168.1.10:40000        93.184.216.34:443
+tcp ESTAB      0      0                                 192.168.1.10:40001        93.184.215.14:80   users:(("Web Content",pid=77,fd=9),("firefox",pid=76,fd=80))
+udp ESTAB      0      0                                 192.168.1.10:40002        162.159.200.1:123   users:(("chronyd",pid=500,fd=5))

@@ -1,0 +1,35 @@
+#!/bin/bash
+# 假的 curl：带 -x 时视为 "proxy"，否则按程序名返回 $FAKE_DIR/ip_<名字>。
+# 与真实 curl 一致：-x 与 --noproxy '*' 同时出现时代理被忽略，按直连返回 ip_direct_bypass。
+# 若存在 $FAKE_DIR/flaky_<名字>（内容为 N），前 N 次调用模拟超时。
+name=$(basename "$0")
+echo "$name $*" >> "$FAKE_DIR/curl.log"
+has_x=0; noproxy_all=0; prev=""
+for a in "$@"; do
+    [ "$a" = "-x" ] && has_x=1
+    [ "$prev" = "--noproxy" ] && [ "$a" = "*" ] && noproxy_all=1
+    prev="$a"
+done
+# 存在 $FAKE_DIR/sleep_proxy（内容为秒数）时，经代理的请求先等待这么久，模拟节点很慢
+if [ "$has_x" = 1 ] && [ -f "$FAKE_DIR/sleep_proxy" ]; then
+    sleep "$(cat "$FAKE_DIR/sleep_proxy")"
+fi
+if [ "$has_x" = 1 ]; then
+    if [ "$noproxy_all" = 1 ]; then
+        cat "$FAKE_DIR/ip_direct_bypass" 2>/dev/null || echo 192.0.2.99
+        exit 0
+    fi
+    name=proxy
+fi
+flaky="$FAKE_DIR/flaky_$name"
+if [ -f "$flaky" ]; then
+    n=$(cat "$flaky")
+    if [ "$n" -gt 0 ]; then
+        echo $((n - 1)) > "$flaky"
+        echo "curl: (28) Operation timed out after 10003 milliseconds with 0 bytes received"
+        exit 28
+    fi
+fi
+cat "$FAKE_DIR/ip_$name"
+[ "$name" = proxy ] && exit "$(cat "$FAKE_DIR/rc_proxy" 2>/dev/null || echo 0)"
+exit 0

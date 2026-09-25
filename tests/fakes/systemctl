@@ -1,0 +1,20 @@
+#!/bin/bash
+# 假的 systemctl：状态保存在 $FAKE_DIR/state，行为由标志文件控制。
+echo "systemctl $*" >> "$FAKE_DIR/calls.log"
+state_file="$FAKE_DIR/state"
+case "$1" in
+    is-active)
+        s=$(cat "$state_file" 2>/dev/null || echo active)
+        echo "$s"; [ "$s" = "active" ]; exit $? ;;
+    reload)
+        n=$(( $(cat "$FAKE_DIR/reload_count" 2>/dev/null || echo 0) + 1 ))
+        echo "$n" > "$FAKE_DIR/reload_count"
+        cp "$PROXYCTL_CONFIG" "$FAKE_DIR/reloaded.$n" 2>/dev/null
+        if [ -f "$FAKE_DIR/reload_fail" ]; then echo "Job for dae.service failed."; exit 1; fi
+        if [ -f "$FAKE_DIR/die_on_first_reload" ] && [ "$n" -eq 1 ]; then echo failed > "$state_file"; fi
+        if [ -f "$FAKE_DIR/revive_on_reload" ] && [ "$n" -ge 2 ]; then echo active > "$state_file"; fi
+        exit 0 ;;
+    show)
+        cat "$FAKE_DIR/restart" 2>/dev/null || echo on-failure; exit 0 ;;
+esac
+echo "fake systemctl: unsupported $*"; exit 1

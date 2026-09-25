@@ -1,0 +1,6 @@
+#!/bin/bash
+# 假的 ss：-l 时输出监听样本，否则输出连接样本。
+case "$1" in
+    *l*) cat "$FAKE_SS_LISTEN" 2>/dev/null ;;
+    *) cat "$FAKE_SS_SAMPLE" ;;
+esac

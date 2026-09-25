@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- proxyctl 应用图标：一条线路在分岔口分流——一支点亮走代理（绿），一支保持直连（白）。
+     GNOME 应用图标规格：128×128，圆角底板带底部厚度。 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="base" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b4f7d"/>
+      <stop offset="1" stop-color="#1f2a4a"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#16203a"/>
+      <stop offset="1" stop-color="#101729"/>
+    </linearGradient>
+    <linearGradient id="proxy" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#2ec27e"/>
+      <stop offset="1" stop-color="#8ff0a4"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#8ff0a4" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#8ff0a4" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="shine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 底板：下方深色条带作为厚度 -->
+  <rect x="8" y="12" width="112" height="108" rx="22" fill="url(#edge)"/>
+  <rect x="8" y="8" width="112" height="104" rx="22" fill="url(#base)"/>
+  <rect x="8" y="8" width="112" height="52" rx="22" fill="url(#shine)"/>
+  <rect x="8.5" y="8.5" width="111" height="103" rx="21.5" fill="none" stroke="#ffffff" stroke-opacity="0.10"/>
+
+  <!-- 直连支路（先画，位于下层） -->
+  <path d="M64 96 V74 C64 62 42 58 40 48" fill="none" stroke="#8c97b8"
+        stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="40" cy="34" r="9.5" fill="#26335a" stroke="#aab3cf" stroke-width="5"/>
+
+  <!-- 代理支路：点亮 -->
+  <circle cx="88" cy="34" r="22" fill="url(#glow)"/>
+  <path d="M64 96 V74 C64 62 86 58 88 44 V38" fill="none" stroke="url(#proxy)"
+        stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="88" cy="34" r="11" fill="#8ff0a4"/>
+  <circle cx="88" cy="34" r="5" fill="#ffffff"/>
+
+  <!-- 起点（应用） -->
+  <circle cx="64" cy="98" r="8" fill="#ffffff"/>
+</svg>

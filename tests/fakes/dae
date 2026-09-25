@@ -1,0 +1,14 @@
+#!/bin/bash
+# 假的 dae：只实现 validate，行为由 $FAKE_DIR 下的标志文件控制。
+echo "dae $*" >> "$FAKE_DIR/calls.log"
+if [ "$1" = "validate" ] && [ "$2" = "-c" ]; then
+    f="$3"
+    [ -f "$FAKE_DIR/validate_sleep" ] && sleep "$(cat "$FAKE_DIR/validate_sleep")"
+    case "$f" in *.dae) ;; *) echo "invalid config filename $f: must has suffix .dae"; exit 1;; esac
+    mode=$(stat -c %a "$f")
+    if [ "$mode" != "600" ] && [ "$mode" != "640" ]; then echo "permissions $mode are too open"; exit 1; fi
+    if [ -f "$FAKE_DIR/validate_fail" ]; then echo "fake dae: validate failed"; exit 1; fi
+    if grep -q FAILME "$f"; then echo "fake dae: unsupported text FAILME"; exit 1; fi
+    exit 0
+fi
+echo "fake dae: unsupported $*"; exit 2

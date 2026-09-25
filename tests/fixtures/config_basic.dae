@@ -1,0 +1,33 @@
+global {
+    wan_interface: auto
+    log_level: info
+    auto_config_kernel_parameter: true
+}
+
+node {
+    v2rayn: 'socks5://127.0.0.1:10808'
+}
+
+group {
+    proxy {
+        filter: name(v2rayn)
+        policy: fixed(0)
+    }
+}
+
+routing {
+    # 防止 v2rayN 的实际代理核心再次被 dae 抓住形成回环
+    pname(xray) -> must_direct
+
+    # 网络管理器保持直连
+    pname(NetworkManager) -> must_direct
+
+    # 测试程序
+    pname(curl) -> proxy
+
+    # Signal
+    pname(signal-desktop) -> proxy
+
+    # 其他所有程序默认直连
+    fallback: direct
+}

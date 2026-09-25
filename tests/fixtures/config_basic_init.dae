@@ -1,0 +1,35 @@
+global {
+    wan_interface: auto
+    log_level: info
+    auto_config_kernel_parameter: true
+}
+
+node {
+    v2rayn: 'socks5://127.0.0.1:10808'
+}
+
+group {
+    proxy {
+        filter: name(v2rayn)
+        policy: fixed(0)
+    }
+}
+
+routing {
+    # >>> proxyctl:safety (do not edit) >>>
+    pname(xray) -> must_direct
+    pname(sing-box) -> must_direct
+    pname(mihomo) -> must_direct
+    pname(proxyctl-probe) -> proxy
+    # <<< proxyctl:safety <
+    # >>> proxyctl:direct >>>
+    pname(NetworkManager) -> must_direct
+    # <<< proxyctl:direct <
+    # >>> proxyctl:proxy >>>
+    pname(curl) -> proxy
+    pname(signal-desktop) -> proxy
+    # <<< proxyctl:proxy <
+
+    # 其他所有程序默认直连
+    fallback: direct
+}

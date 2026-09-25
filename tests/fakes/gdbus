@@ -1,0 +1,9 @@
+#!/bin/bash
+# 假的 gdbus：记录调用；存在 $FAKE_DIR/gdbus_fail 时模拟不是 GNOME（调用失败）。
+echo "gdbus $*" >> "$FAKE_DIR/gdbus.log"
+if [ -f "$FAKE_DIR/gdbus_fail" ]; then
+    echo "Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The name org.gnome.Shell was not provided"
+    exit 1
+fi
+echo "gdbus-notify $*" >> "$FAKE_DIR/notify.log"
+echo "(uint32 7,)"

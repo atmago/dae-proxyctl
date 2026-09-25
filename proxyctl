@@ -1,0 +1,3208 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""proxyctl —— 基于 dae 的 Proxifier 式"按应用代理"管理工具（仅控制面）。
+
+dae 负责全部数据面（按进程名 pname 分流），proxyctl 只负责安全地编辑
+/etc/dae/config.dae 中由它管理的三个区块，并做校验、生效、回滚与健康检查。
+
+只使用 Python 3 标准库；GUI 使用系统自带的 PyGObject（优先 GTK4）。
+"""
+
+import argparse
+import datetime
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unicodedata
+
+VERSION = "1.0.0"
+
+# ---------------------------------------------------------------------------
+# 路径与外部程序（全部可用环境变量覆盖，便于测试）
+# ---------------------------------------------------------------------------
+
+
+# /etc/proxyctl.conf 中允许设置的项（键名 = 环境变量名去掉 PROXYCTL_ 前缀后转小写）。
+# sudo、pkexec 和 systemd 定时器都会丢掉环境变量，所以用户设置要写在这个文件里。
+CONF_KEYS = ("socks", "config", "service", "iface", "test_url", "probe_url", "slow_seconds",
+             "connect_slow", "test_retries", "chain_interval", "gui_recent")
+_conf_cache = {}
+
+
+def conf_path():
+    return os.environ.get("PROXYCTL_CONF") or "/etc/proxyctl.conf"
+
+
+def load_conf(path):
+    """读取 key = value 格式的配置；文件必须属于 root（或当前用户）且不可被他人写入，否则忽略。"""
+    if path in _conf_cache:
+        return _conf_cache[path]
+    values = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            st = os.fstat(f.fileno())
+            if st.st_uid in (0, os.geteuid()) and not st.st_mode & 0o022:
+                for line in f:
+                    line = line.split("#", 1)[0].strip()
+                    key, sep, value = line.partition("=")
+                    key = key.strip().lower()
+                    if sep and key in CONF_KEYS and value.strip():
+                        values[key] = value.strip()
+            else:
+                print("警告：%s 不属于 root，或可被其他用户写入，已忽略。" % path, file=sys.stderr)
+    except OSError:
+        pass
+    _conf_cache[path] = values
+    return values
+
+
+def _env(name, default):
+    """优先级：环境变量 > /etc/proxyctl.conf > 内置默认值。"""
+    value = os.environ.get(name)
+    if value:
+        return value
+    return load_conf(conf_path()).get(name[len("PROXYCTL_"):].lower(), default)
+
+
+def config_path():
+    return _env("PROXYCTL_CONFIG", "/etc/dae/config.dae")
+
+
+def dae_bin():
+    return _env("PROXYCTL_DAE_BIN", "dae")
+
+
+def systemctl_bin():
+    return _env("PROXYCTL_SYSTEMCTL", "systemctl")
+
+
+def state_dir():
+    return _env("PROXYCTL_STATE_DIR", "/var/lib/proxyctl")
+
+
+def backup_dir():
+    return os.path.join(state_dir(), "backups")
+
+
+def cache_path():
+    return os.path.join(state_dir(), "rules.json")
+
+
+def lock_path():
+    return os.path.join(state_dir(), "lock")
+
+
+def socks_addr():
+    raw = _env("PROXYCTL_SOCKS", "127.0.0.1:10808")
+    host, _, port = raw.rpartition(":")
+    host = host.strip("[]") or "127.0.0.1"
+    try:
+        return host, int(port)
+    except ValueError:
+        return "127.0.0.1", 10808
+
+
+def socks_str():
+    host, port = socks_addr()
+    return "[%s]:%d" % (host, port) if ":" in host else "%s:%d" % (host, port)
+
+
+def service_name():
+    return _env("PROXYCTL_SERVICE", "dae")
+
+
+def lib_dir():
+    return _env("PROXYCTL_LIBDIR", "/usr/local/lib/proxyctl")
+
+
+def ss_bin():
+    return _env("PROXYCTL_SS", "ss")
+
+
+def curl_bin():
+    return _env("PROXYCTL_CURL", "curl")
+
+
+def notify_bin():
+    return _env("PROXYCTL_NOTIFY_SEND", "notify-send")
+
+
+def gdbus_bin():
+    return _env("PROXYCTL_GDBUS", "gdbus")
+
+
+def sudo_bin():
+    return _env("PROXYCTL_SUDO", "sudo")
+
+
+def pkexec_bin():
+    return _env("PROXYCTL_PKEXEC", "pkexec")
+
+
+def self_bin():
+    """安装后的 proxyctl 绝对路径（desktop 文件与 pkexec 使用）。"""
+    return _env("PROXYCTL_SELF", "/usr/local/bin/proxyctl")
+
+
+def proc_dir():
+    return _env("PROXYCTL_PROC", "/proc")
+
+
+def test_url():
+    return _env("PROXYCTL_TEST_URL", "https://ifconfig.me/ip")
+
+
+def extra_ifaces():
+    """除默认路由所在接口外，额外检查 IPv6 的接口（逗号或空格分隔，默认无）。"""
+    return set(re.split(r"[\s,]+", _env("PROXYCTL_IFACE", "").strip())) - {""}
+
+
+def reload_settle():
+    try:
+        return float(_env("PROXYCTL_RELOAD_SETTLE", "2"))
+    except ValueError:
+        return 2.0
+
+
+def lock_timeout():
+    try:
+        return float(_env("PROXYCTL_LOCK_TIMEOUT", "30"))
+    except ValueError:
+        return 30.0
+
+
+# ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
+
+NAME_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
+COMM_MAX = 15  # 内核 TASK_COMM_LEN=16，进程名最多 15 个字符
+
+BLACKLIST = frozenset("""
+python python3 python3. node nodejs java electron bash sh zsh fish dash perl
+ruby php dotnet mono wine wine64 wineserver systemd sudo ssh curl wget git
+""".split())
+BLACKLIST_RE = re.compile(r"python3\.[0-9]*")  # python3.12、python3.14 ……
+
+SAFETY_RULES = (
+    ("xray", "must_direct"),
+    ("sing-box", "must_direct"),
+    ("mihomo", "must_direct"),
+    ("proxyctl-probe", "proxy"),
+)
+SAFETY_NAMES = {n: o for n, o in SAFETY_RULES}
+CORE_NAMES = ("xray", "sing-box", "mihomo")
+
+BLOCKS = ("safety", "direct", "proxy")
+BLOCK_OUTBOUND = {"direct": "must_direct", "proxy": "proxy"}
+BEGIN_MARK = {
+    "safety": "# >>> proxyctl:safety (do not edit) >>>",
+    "direct": "# >>> proxyctl:direct >>>",
+    "proxy": "# >>> proxyctl:proxy >>>",
+}
+END_MARK = {b: "# <<< proxyctl:%s <" % b for b in BLOCKS}
+MARKERISH_RE = re.compile(r"^#\s*(>>>|<<<)\s*proxyctl:")
+
+RULE_RE = re.compile(r"^\s*pname\(\s*([^()\s,]+)\s*\)\s*->\s*([A-Za-z_][A-Za-z0-9_-]*)\s*$")
+ROUTING_OPEN_RE = re.compile(r"^\s*routing\s*\{\s*$")
+ROUTING_WORD_RE = re.compile(r"^\s*routing\b")
+
+STATUS_PROXY = "代理"
+STATUS_DIRECT = "直连保护"
+STATUS_DEFAULT = "默认直连"
+STATUS_UNKNOWN = "未知"
+STATUS_CHILD = "未代理子进程"
+
+
+class ProxyctlError(Exception):
+    """可直接展示给用户的中文错误。"""
+
+
+# ---------------------------------------------------------------------------
+# 名称校验
+# ---------------------------------------------------------------------------
+
+
+def validate_name(name):
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
+        raise ProxyctlError(
+            "进程名 %r 不合法：只允许字母、数字和 . _ + -，长度 1–64。"
+            "（这样可以防止向 dae 配置注入语法。）" % (name,))
+    return name
+
+
+def is_blacklisted(name):
+    low = name.lower()
+    return low in BLACKLIST or bool(BLACKLIST_RE.fullmatch(low))
+
+
+def blacklist_reason(name):
+    return (
+        "“%s”是通用运行时/系统工具的进程名。dae 的 pname 只按进程名匹配，"
+        "加入代理名单会把所有同名程序一起送进代理（例如 python3 会把量化交易等"
+        "其他 Python 程序也代理掉）。请改用该应用自身的代理设置，"
+        "例如 SOCKS5 %s 或环境变量 ALL_PROXY=socks5h://%s。" % (name, socks_str(), socks_str()))
+
+
+def long_name_warning(name):
+    if len(name) > COMM_MAX:
+        return ("警告：进程名“%s”超过 %d 个字符。Linux 内核中的进程名会被截断为前 %d 个字符"
+                "（%s），dae 看到的是截断后的名字，这条规则很可能不会命中。"
+                % (name, COMM_MAX, COMM_MAX, name[:COMM_MAX]))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 配置解析
+# ---------------------------------------------------------------------------
+
+
+def code_part(line, keep_strings=False):
+    """去掉行尾换行和注释；默认还去掉引号内的内容，只留下用于结构分析的代码部分。"""
+    line = line.rstrip("\r\n")
+    out = []
+    quote = None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if keep_strings:
+                out.append(line[i:i + 2] if c == "\\" else c)
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+            if keep_strings:
+                out.append(c)
+            i += 1
+            continue
+        if c == "#":
+            break
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def is_comment_line(line):
+    s = line.strip()
+    return s.startswith("#") and not code_part(line).strip()
+
+
+def is_blank(line):
+    return not line.strip()
+
+
+class Parsed(object):
+    """config.dae 的结构化视图。lines 保留原始换行符，便于逐字节还原。"""
+
+    def __init__(self, text):
+        self.text = text
+        self.lines = text.splitlines(True)
+        self.nl = "\r\n" if "\r\n" in text else "\n"
+        self.rs = None  # routing { 所在行
+        self.re = None  # routing 结束 } 所在行
+        self.blocks = None  # {block: (begin, end)} 或 None（未初始化）
+        self.entries = {b: [] for b in BLOCKS}
+        self.indent = "    "
+        self._parse()
+
+    # -- 结构 --------------------------------------------------------------
+    def _parse(self):
+        depth = 0
+        routing = []
+        for i, line in enumerate(self.lines):
+            code = code_part(line)
+            if depth == 0 and ROUTING_WORD_RE.match(code):
+                if not ROUTING_OPEN_RE.match(code):
+                    raise ProxyctlError(
+                        "第 %d 行的 routing 块写法无法可靠解析（要求“routing {”单独占一行）。"
+                        "为安全起见未做任何修改。" % (i + 1))
+                routing.append(i)
+            for c in code:
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth < 0:
+                        raise ProxyctlError("配置第 %d 行出现多余的“}”，结构无法可靠解析，未做任何修改。" % (i + 1))
+            if routing and self.re is None and len(routing) == 1 and i > routing[0] and depth == 0:
+                self.re = i
+        if depth != 0:
+            raise ProxyctlError("配置中的大括号不配对，结构无法可靠解析，未做任何修改。")
+        if not routing:
+            raise ProxyctlError("配置中找不到 routing 块，无法管理规则，未做任何修改。")
+        if len(routing) > 1:
+            raise ProxyctlError("配置中有多个 routing 块，无法可靠判断，未做任何修改。")
+        self.rs = routing[0]
+        if self.re is None or code_part(self.lines[self.re]).strip() != "}":
+            raise ProxyctlError("routing 块的结束“}”必须单独占一行，结构无法可靠解析，未做任何修改。")
+        for i in range(self.rs + 1, self.re):
+            code = code_part(self.lines[i])
+            if "{" in code or "}" in code:
+                raise ProxyctlError("routing 块第 %d 行包含大括号，结构无法可靠解析，未做任何修改。" % (i + 1))
+        self._parse_markers()
+
+    def _parse_markers(self):
+        found = {}
+        for i, line in enumerate(self.lines):
+            s = line.strip()
+            if not MARKERISH_RE.match(s):
+                continue
+            if not (self.rs < i < self.re):
+                raise ProxyctlError("第 %d 行的 proxyctl 标记位于 routing 块之外，标记已损坏。" % (i + 1))
+            key = None
+            for b in BLOCKS:
+                if s == BEGIN_MARK[b]:
+                    key = (b, "begin")
+                elif s == END_MARK[b]:
+                    key = (b, "end")
+            if key is None:
+                raise ProxyctlError("第 %d 行的 proxyctl 标记无法识别：%s（标记已损坏）" % (i + 1, s))
+            if key in found:
+                raise ProxyctlError("proxyctl 标记重复出现（第 %d 行和第 %d 行），标记已损坏。"
+                                    % (found[key] + 1, i + 1))
+            found[key] = i
+        if not found:
+            self.blocks = None
+            body = [l for l in self.lines[self.rs + 1:self.re] if l.strip()]
+            if body:
+                self.indent = re.match(r"^[ \t]*", body[0]).group(0) or "    "
+            return
+        order = []
+        for b in BLOCKS:
+            for kind in ("begin", "end"):
+                if (b, kind) not in found:
+                    raise ProxyctlError(
+                        "proxyctl 管理区块不完整（缺少 %s 区块的%s标记），标记已损坏。"
+                        "请手工修复，或用 proxyctl restore 恢复备份。"
+                        % (b, "开始" if kind == "begin" else "结束"))
+                order.append(found[(b, kind)])
+        if order != sorted(order):
+            raise ProxyctlError("proxyctl 管理区块的顺序不正确（必须是 safety → direct → proxy），标记已损坏。")
+        self.blocks = {b: (found[(b, "begin")], found[(b, "end")]) for b in BLOCKS}
+        self.indent = re.match(r"^[ \t]*", self.lines[found[("safety", "begin")]]).group(0)
+        for b in BLOCKS:
+            begin, end = self.blocks[b]
+            for i in range(begin + 1, end):
+                line = self.lines[i]
+                if is_blank(line):
+                    continue
+                m = RULE_RE.match(line.rstrip("\r\n"))
+                if not m or not NAME_RE.fullmatch(m.group(1)):
+                    raise ProxyctlError("管理区块 %s 的第 %d 行无法识别：%s（请不要手工编辑管理区块）"
+                                        % (b, i + 1, line.strip()))
+                name, outbound = m.group(1), m.group(2)
+                if b in BLOCK_OUTBOUND and outbound != BLOCK_OUTBOUND[b]:
+                    raise ProxyctlError("管理区块 %s 的第 %d 行出口应为 %s：%s"
+                                        % (b, i + 1, BLOCK_OUTBOUND[b], line.strip()))
+                if b == "safety" and outbound not in ("proxy", "must_direct"):
+                    raise ProxyctlError("安全区块第 %d 行出口无法识别：%s" % (i + 1, line.strip()))
+                self.entries[b].append((name, outbound))
+
+    # -- 查询 --------------------------------------------------------------
+    @property
+    def initialized(self):
+        return self.blocks is not None
+
+    def names(self, block):
+        seen = []
+        for n, _ in self.entries[block]:
+            if n not in seen:
+                seen.append(n)
+        return seen
+
+    def managed_index(self):
+        idx = set()
+        if self.blocks:
+            for b in BLOCKS:
+                begin, end = self.blocks[b]
+                idx.update(range(begin, end + 1))
+        return idx
+
+    def unmanaged_rules(self):
+        """routing 中不受 proxyctl 管理的规则行（去掉注释和空行）。"""
+        managed = self.managed_index()
+        out = []
+        for i in range(self.rs + 1, self.re):
+            if i in managed:
+                continue
+            code = code_part(self.lines[i], keep_strings=True).strip()
+            if code:
+                out.append((i, code))
+        return out
+
+    def unmanaged_pname_rules(self):
+        out = []
+        for i, code in self.unmanaged_rules():
+            m = RULE_RE.match(code)
+            if m:
+                out.append((m.group(1), m.group(2)))
+        return out
+
+    def rules_before_safety(self):
+        if not self.blocks:
+            return []
+        return [c for i, c in self.unmanaged_rules() if i < self.blocks["safety"][0]]
+
+    def safety_complete(self):
+        return self.initialized and list(self.entries["safety"][:len(SAFETY_RULES)]) == list(SAFETY_RULES)
+
+    def global_value(self, key):
+        """读取 global 块中某个键的值（仅做信息展示）。"""
+        depth = 0
+        in_global = False
+        for line in self.lines:
+            code = code_part(line)
+            if depth == 0 and re.match(r"^\s*global\s*\{", code):
+                in_global = True
+            elif in_global and depth == 1:
+                m = re.match(r"^\s*%s\s*:\s*(.+?)\s*$" % re.escape(key), code)
+                if m:
+                    return m.group(1).strip("'\"")
+            depth += code.count("{") - code.count("}")
+            if depth == 0:
+                in_global = False
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 渲染
+# ---------------------------------------------------------------------------
+
+
+def _dedupe(entries):
+    out = []
+    for e in entries:
+        if e not in out:
+            out.append(e)
+    return out
+
+
+def safety_entries(existing, messages=None):
+    """规范的安全区块：固定规则永远在最前面；用户额外加入的合法规则不删除。"""
+    out = list(SAFETY_RULES)
+    for name, outbound in existing:
+        if name in SAFETY_NAMES:
+            if outbound != SAFETY_NAMES[name] and messages is not None:
+                messages.append("警告：安全区块中的 pname(%s) -> %s 与固定规则冲突且永远不会命中，已由固定规则取代。"
+                                % (name, outbound))
+            continue
+        if (name, outbound) not in out:
+            out.append((name, outbound))
+    return out
+
+
+def render_block(block, entries, indent, nl):
+    lines = [indent + BEGIN_MARK[block] + nl]
+    for name, outbound in _dedupe(entries):
+        lines.append("%spname(%s) -> %s%s" % (indent, name, outbound, nl))
+    lines.append(indent + END_MARK[block] + nl)
+    return lines
+
+
+def render(parsed, lists):
+    """仅替换三个管理区块（含标记行），其余每一行原样保留。"""
+    assert parsed.initialized
+    lines = list(parsed.lines)
+    for block in reversed(BLOCKS):
+        begin, end = parsed.blocks[block]
+        nl = parsed.nl
+        if lines[end].endswith("\r\n"):
+            nl = "\r\n"
+        elif lines[end].endswith("\n"):
+            nl = "\n"
+        new = render_block(block, lists[block], parsed.indent, nl)
+        if not lines[end].endswith(("\n", "\r")):
+            new[-1] = new[-1].rstrip("\r\n")
+        lines[begin:end + 1] = new
+    return "".join(lines)
+
+
+def current_lists(parsed, messages=None):
+    return {
+        "safety": safety_entries(parsed.entries["safety"], messages),
+        "direct": [(n, "must_direct") for n in parsed.names("direct")],
+        "proxy": [(n, "proxy") for n in parsed.names("proxy")],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 配置变换（纯函数：旧文本 -> (新文本, 消息列表)）
+# ---------------------------------------------------------------------------
+
+
+def op_init(text):
+    parsed = Parsed(text)
+    msgs = []
+    if parsed.initialized:
+        lists = current_lists(parsed, msgs)
+        if parsed.entries["safety"] != lists["safety"]:
+            msgs.append("安全区块不完整或有偏差，已修复。")
+        else:
+            msgs.append("管理区块已存在，安全区块完整。")
+        for name in parsed.names("proxy"):
+            if is_blacklisted(name):
+                msgs.append("警告：代理名单中包含通用运行时名称“%s”，建议执行 proxyctl remove %s。" % (name, name))
+        return render(parsed, lists), msgs
+
+    lines = parsed.lines
+    rs, re_ = parsed.rs, parsed.re
+    removed = set()
+    direct, proxy = [], []
+    effective = {}  # name -> outbound（首条命中）
+    for i in range(rs + 1, re_):
+        code = code_part(lines[i], keep_strings=True).strip()
+        if not code:
+            continue
+        m = RULE_RE.match(code)
+        if not m or m.group(2) not in ("proxy", "must_direct"):
+            continue
+        name, outbound = m.group(1), m.group(2)
+        if not NAME_RE.fullmatch(name):
+            msgs.append("警告：第 %d 行的进程名“%s”不符合命名规则，保留原位，未迁移。" % (i + 1, name))
+            continue
+        if name in SAFETY_NAMES:
+            if outbound != SAFETY_NAMES[name]:
+                msgs.append("警告：第 %d 行 pname(%s) -> %s 与安全区块冲突，已被安全区块覆盖，保留原位未迁移。"
+                            % (i + 1, name, outbound))
+                continue
+        elif name in effective:
+            if effective[name] != outbound:
+                msgs.append("警告：第 %d 行 pname(%s) -> %s 与前面的规则冲突（首条命中生效，本行从未生效），"
+                            "保留原位未迁移。" % (i + 1, name, outbound))
+                continue
+        else:
+            effective[name] = outbound
+            (proxy if outbound == "proxy" else direct).append(name)
+        removed.add(i)
+        prev = i - 1
+        if prev > rs and prev not in removed and is_comment_line(lines[prev]) \
+                and not MARKERISH_RE.match(lines[prev].strip()) \
+                and not (prev - 1 > rs and is_comment_line(lines[prev - 1])):
+            removed.add(prev)
+
+    body = []
+    last_blank = False
+    pending_removed = False
+    for i in range(rs + 1, re_):
+        if i in removed:
+            pending_removed = True
+            continue
+        if is_blank(lines[i]) and last_blank and pending_removed:
+            continue  # 删除规则后留下的连续空行合并为一行
+        body.append(lines[i])
+        last_blank = is_blank(lines[i])
+        pending_removed = False
+
+    indent = parsed.indent
+    nl = parsed.nl
+    managed = []
+    lists = {"safety": list(SAFETY_RULES),
+             "direct": [(n, "must_direct") for n in direct],
+             "proxy": [(n, "proxy") for n in proxy]}
+    for b in BLOCKS:
+        managed.extend(render_block(b, lists[b], indent, nl))
+    if body and not is_blank(body[0]):
+        managed.append(nl)
+    new_lines = lines[:rs + 1] + managed + body + lines[re_:]
+    new_text = "".join(new_lines)
+
+    msgs.append("已创建管理区块（safety / direct / proxy）。")
+    for n in direct:
+        msgs.append("已迁移到直连保护：%s" % n)
+    for n in proxy:
+        msgs.append("已迁移到代理名单：%s" % n)
+        if is_blacklisted(n):
+            msgs.append("警告：“%s”是通用运行时名称，已按原样保留在代理名单中，建议执行 proxyctl remove %s。"
+                        % (n, n))
+    return new_text, msgs
+
+
+def _require_init(parsed):
+    if not parsed.initialized:
+        raise ProxyctlError("配置尚未初始化（找不到 proxyctl 管理区块），请先执行：sudo proxyctl init")
+
+
+def _unmanaged_note(parsed, name):
+    hits = ["pname(%s) -> %s" % (n, o) for n, o in parsed.unmanaged_pname_rules() if n == name]
+    if hits:
+        return ("提示：routing 中还有不受 proxyctl 管理的规则涉及“%s”（%s）。由于首条命中生效，"
+                "排在前面的 proxyctl 规则优先。" % (name, "；".join(hits)))
+    return None
+
+
+def op_add(text, name):
+    validate_name(name)
+    if is_blacklisted(name):
+        raise ProxyctlError("拒绝加入代理名单。" + blacklist_reason(name))
+    parsed = Parsed(text)
+    _require_init(parsed)
+    msgs = []
+    lists = current_lists(parsed, msgs)
+    if name in SAFETY_NAMES:
+        if SAFETY_NAMES[name] == "proxy":
+            msgs.append("“%s”已在安全区块中走代理，无需添加。" % name)
+            return render(parsed, lists), msgs
+        raise ProxyctlError("“%s”在安全区块中是直连（must_direct），它是代理核心，走代理会形成回环，拒绝添加。" % name)
+    if name in [n for n, o in lists["safety"] if o == "must_direct"] or name in parsed.names("direct"):
+        raise ProxyctlError("冲突：“%s”已在直连保护名单中。如确需代理，请先执行 proxyctl unprotect %s。" % (name, name))
+    if name in parsed.names("proxy"):
+        msgs.append("“%s”已在代理名单中，无需重复添加。" % name)
+        return render(parsed, lists), msgs
+    lists["proxy"].append((name, "proxy"))
+    msgs.append("已加入代理名单：%s" % name)
+    for note in (long_name_warning(name), _unmanaged_note(parsed, name)):
+        if note:
+            msgs.append(note)
+    return render(parsed, lists), msgs
+
+
+def op_remove(text, name):
+    validate_name(name)
+    parsed = Parsed(text)
+    _require_init(parsed)
+    msgs = []
+    lists = current_lists(parsed, msgs)
+    if name in [n for n, _ in lists["safety"]]:
+        raise ProxyctlError("“%s”属于安全区块，任何命令都不能删除安全区块中的规则。" % name)
+    if name not in parsed.names("proxy"):
+        raise ProxyctlError("“%s”不在代理名单中。" % name)
+    lists["proxy"] = [e for e in lists["proxy"] if e[0] != name]
+    msgs.append("已从代理名单移除：%s" % name)
+    return render(parsed, lists), msgs
+
+
+def op_protect(text, name):
+    validate_name(name)
+    parsed = Parsed(text)
+    _require_init(parsed)
+    msgs = []
+    lists = current_lists(parsed, msgs)
+    safety = dict(lists["safety"])
+    if name in safety:
+        if safety[name] == "must_direct":
+            msgs.append("“%s”已在安全区块中直连保护，无需添加。" % name)
+            return render(parsed, lists), msgs
+        raise ProxyctlError("“%s”在安全区块中走代理（用于自检），不能改为直连。" % name)
+    if name in parsed.names("proxy"):
+        raise ProxyctlError("冲突：“%s”在代理名单中。如需改为直连保护，请先执行 proxyctl remove %s。" % (name, name))
+    if name in parsed.names("direct"):
+        msgs.append("“%s”已在直连保护名单中，无需重复添加。" % name)
+        return render(parsed, lists), msgs
+    lists["direct"].append((name, "must_direct"))
+    msgs.append("已加入直连保护：%s" % name)
+    for note in (long_name_warning(name), _unmanaged_note(parsed, name)):
+        if note:
+            msgs.append(note)
+    return render(parsed, lists), msgs
+
+
+def op_unprotect(text, name):
+    validate_name(name)
+    parsed = Parsed(text)
+    _require_init(parsed)
+    msgs = []
+    lists = current_lists(parsed, msgs)
+    if name in [n for n, _ in lists["safety"]]:
+        raise ProxyctlError("“%s”属于安全区块，任何命令都不能删除安全区块中的规则。" % name)
+    if name not in parsed.names("direct"):
+        raise ProxyctlError("“%s”不在直连保护名单中。" % name)
+    lists["direct"] = [e for e in lists["direct"] if e[0] != name]
+    msgs.append("已从直连保护移除：%s" % name)
+    return render(parsed, lists), msgs
+
+
+# ---------------------------------------------------------------------------
+# 外部命令
+# ---------------------------------------------------------------------------
+
+
+def run_cmd(argv, timeout=60, env=None):
+    """执行外部命令，返回 (returncode, 合并后的输出)。找不到程序时返回 127。"""
+    try:
+        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           stdin=subprocess.DEVNULL, timeout=timeout, env=env)
+        return p.returncode, p.stdout.decode("utf-8", "replace")
+    except FileNotFoundError:
+        return 127, "找不到程序：%s" % argv[0]
+    except subprocess.TimeoutExpired:
+        return 124, "执行超时（%ss）：%s" % (timeout, " ".join(argv))
+    except OSError as e:
+        return 126, "无法执行 %s：%s" % (argv[0], e)
+
+
+SOCKS_URL_RE = re.compile(r"socks5h?://(?:[^@'\"\s]*@)?([^'\"\s/#?]+)")
+
+
+def config_socks_addrs(text):
+    """dae 配置中出现的 socks5:// 节点地址（localhost 统一为 127.0.0.1）。"""
+    addrs = set()
+    for m in SOCKS_URL_RE.finditer(text):
+        host, _, port = m.group(1).rpartition(":")
+        if host.lower() == "localhost":
+            host = "127.0.0.1"
+        addrs.add("%s:%s" % (host, port))
+    return addrs
+
+
+def dae_validate(path):
+    return run_cmd([dae_bin(), "validate", "-c", path], timeout=60)
+
+
+def service_state():
+    rc, out = run_cmd([systemctl_bin(), "is-active", service_name()], timeout=15)
+    state = out.strip().splitlines()[-1].strip() if out.strip() else "unknown"
+    if rc == 127:
+        return "unknown"
+    return state
+
+
+def service_active():
+    return service_state() == "active"
+
+
+def service_reload():
+    return run_cmd([systemctl_bin(), "reload", service_name()], timeout=60)
+
+
+def service_restart_policy():
+    rc, out = run_cmd([systemctl_bin(), "show", service_name(), "-p", "Restart", "--value"], timeout=15)
+    return out.strip() if rc == 0 else None
+
+
+def wait_still_active(settle):
+    """reload 之后观察一段时间，确认服务仍为 active。"""
+    deadline = time.monotonic() + max(settle, 0)
+    state = service_state()
+    while True:
+        if state not in ("active", "reloading"):
+            return False, state
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+        state = service_state()
+    # reloading 可能持续片刻，再多等一会
+    for _ in range(20):
+        if state != "reloading":
+            break
+        time.sleep(0.25)
+        state = service_state()
+    return state == "active", state
+
+
+def socks_listening(timeout=1.0):
+    host, port = socks_addr()
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def gvariant_str(s):
+    """把 Python 字符串写成 GVariant 文本格式的字符串字面量（gdbus call 的参数）。"""
+    return "'%s'" % (s.replace("\\", "\\\\").replace("'", "\\'")
+                     .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
+
+
+def notify(title, body, urgency="critical"):
+    """弹出桌面通知。
+
+    实测本机 GNOME 的通知转发进程（org.gnome.Shell.Notifications）会“接收却不显示”
+    notify-send 的通知（返回成功，所以无法据此判断失败），而直接调用 GNOME Shell
+    自身的 org.freedesktop.Notifications 接口可以正常弹出。因此优先直接调用 GNOME Shell；
+    不是 GNOME 或调用失败时，再退回 notify-send。
+    """
+    level = {"low": 0, "normal": 1, "critical": 2}.get(urgency, 2)
+    rc, _ = run_cmd([gdbus_bin(), "call", "--session", "--dest", "org.gnome.Shell",
+                     "--object-path", "/org/freedesktop/Notifications",
+                     "--method", "org.freedesktop.Notifications.Notify",
+                     gvariant_str("proxyctl"), "uint32 0", gvariant_str(""),
+                     gvariant_str(title), gvariant_str(body), "@as []",
+                     "{'urgency': <byte %d>}" % level, "int32 -1"], timeout=10)
+    if rc != 0:
+        run_cmd([notify_bin(), "-u", urgency, "-a", "proxyctl", title, body], timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# 进程信息
+# ---------------------------------------------------------------------------
+
+
+def process_table():
+    """返回 {pid: (进程名, 父 pid)}，读取 /proc/*/stat（非 root 也可读所有进程）。"""
+    table = {}
+    try:
+        entries = os.listdir(proc_dir())
+    except OSError:
+        return table
+    for e in entries:
+        if not e.isdigit():
+            continue
+        base = os.path.join(proc_dir(), e)
+        try:
+            with open(os.path.join(base, "stat"), "r", encoding="utf-8", errors="replace") as f:
+                data = f.read()
+            # 进程名在括号中，本身可能含空格或括号，所以取最后一个 ")"
+            comm = data[data.index("(") + 1:data.rindex(")")]
+            ppid = int(data[data.rindex(")") + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            try:
+                with open(os.path.join(base, "comm"), "r", encoding="utf-8", errors="replace") as f:
+                    comm, ppid = f.read().strip(), 0
+            except OSError:
+                continue
+        table[int(e)] = (comm, ppid)
+    return table
+
+
+def running_processes():
+    """返回 {进程名: [pid, ...]}。"""
+    out = {}
+    for pid, (comm, _) in process_table().items():
+        out.setdefault(comm, []).append(pid)
+    return out
+
+
+def unproxied_children(view, table=None):
+    """找出代理名单中程序的子孙进程里，名字不同且不在任何名单中的进程。
+
+    pname 只按进程名匹配：ChatGPT 在名单中，它的子进程 codex 却不会因此走代理。
+    这类子进程往往只在登录、同步时短暂联网，ss 快照很难抓到，所以直接从进程树找。
+    遇到这类进程后不再向下查找（它的子进程与名单程序已隔了一层）；
+    通用运行时名称（bash、python3 等）不能加入代理名单，也不列出。
+    返回 {进程名: {"name", "parents": set, "pids": set}}。
+    """
+    if not view:
+        return {}
+    if table is None:
+        table = process_table()
+    safety = view.get("safety", [])
+    proxied = {n[:COMM_MAX] for n in view.get("proxy", [])}
+    proxied |= {n[:COMM_MAX] for n, o in safety if o == "proxy"}
+    listed = set(proxied)
+    listed |= {n[:COMM_MAX] for n in view.get("direct", [])}
+    listed |= {n[:COMM_MAX] for n, _ in safety}
+    listed |= {n[:COMM_MAX] for n, _ in view.get("unmanaged_pname", [])}
+    children = {}
+    for pid, (_, ppid) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    found = {}
+    for pid, (comm, _) in table.items():
+        if comm not in proxied:
+            continue
+        stack = list(children.get(pid, []))
+        while stack:
+            child = stack.pop()
+            ccomm = table[child][0]
+            if ccomm in proxied:
+                continue  # 它自己也会作为起点被检查
+            if ccomm in listed or not NAME_RE.fullmatch(ccomm) or is_blacklisted(ccomm):
+                continue
+            item = found.setdefault(ccomm, {"name": ccomm, "parents": set(), "pids": set()})
+            item["parents"].add(comm)
+            item["pids"].add(child)
+    return found
+
+
+def process_running(name):
+    return name[:COMM_MAX] in running_processes()
+
+
+# ---------------------------------------------------------------------------
+# ss 输出解析
+# ---------------------------------------------------------------------------
+
+SS_USERS_RE = re.compile(r'\("((?:[^"\\]|\\.)*)",pid=(\d+),fd=\d+\)')
+
+
+def split_addr(s):
+    """把 ss 的“地址:端口”拆开，返回 (ip 对象或 None, 端口字符串)。"""
+    if s.startswith("["):
+        end = s.find("]")
+        host, port = s[1:end], s[end + 2:]
+    else:
+        host, _, port = s.rpartition(":")
+    host = host.split("%", 1)[0]
+    if host in ("*", ""):
+        return None, port
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None, port
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip, port
+
+
+def is_local_ip(ip):
+    return (ip is None or ip.is_loopback or ip.is_private or ip.is_link_local
+            or ip.is_multicast or ip.is_unspecified or ip.is_reserved)
+
+
+def parse_ss(output):
+    """解析 `ss -tunpH` 输出，返回连接列表。"""
+    conns = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 6 or parts[0] not in ("tcp", "udp", "raw", "sctp"):
+            continue
+        netid, st, local, peer = parts[0], parts[1], parts[4], parts[5]
+        rest = " ".join(parts[6:])
+        procs = [(n.replace('\\"', '"'), int(p)) for n, p in SS_USERS_RE.findall(rest)]
+        ip, port = split_addr(peer)
+        conns.append({"netid": netid, "state": st, "local": local, "peer": peer,
+                      "peer_ip": ip, "peer_port": port, "procs": procs})
+    return conns
+
+
+def aggregate(conns, max_samples=3):
+    """按进程名聚合联网中的连接（排除回环与局域网）。"""
+    agg = {}
+    for c in conns:
+        if is_local_ip(c["peer_ip"]):
+            continue
+        names = {}
+        for n, pid in c["procs"]:
+            names.setdefault(n, set()).add(pid)
+        if not names:
+            names = {"(未知进程)": set()}
+        ip = c["peer_ip"]
+        sample = ("[%s]:%s" % (ip, c["peer_port"])) if ip.version == 6 else "%s:%s" % (ip, c["peer_port"])
+        for n, pids in names.items():
+            a = agg.setdefault(n, {"name": n, "pids": set(), "conns": 0, "samples": []})
+            a["pids"].update(pids)
+            a["conns"] += 1
+            if sample not in a["samples"] and len(a["samples"]) < max_samples:
+                a["samples"].append(sample)
+    return sorted(agg.values(), key=lambda a: (-a["conns"], a["name"]))
+
+
+def collect_connections():
+    rc, out = run_cmd([ss_bin(), "-tunpH"], timeout=15)
+    if rc != 0:
+        raise ProxyctlError("执行 ss 失败：%s" % out.strip())
+    return aggregate(parse_ss(out))
+
+
+# ---------------------------------------------------------------------------
+# 规则视图（读取配置；非 root 时退回到缓存）
+# ---------------------------------------------------------------------------
+
+
+def read_config_text():
+    with open(config_path(), "rb") as f:
+        data = f.read()
+    try:
+        return data.decode("utf-8"), data
+    except UnicodeDecodeError:
+        raise ProxyctlError("配置文件不是 UTF-8 编码，无法安全编辑，未做任何修改。")
+
+
+def rules_view_from_parsed(parsed):
+    msgs = []
+    lists = current_lists(parsed, msgs) if parsed.initialized else {b: [] for b in BLOCKS}
+    return {
+        "initialized": parsed.initialized,
+        "safety": [list(e) for e in (lists["safety"] if parsed.initialized else [])],
+        "direct": parsed.names("direct"),
+        "proxy": parsed.names("proxy"),
+        "unmanaged_pname": [list(e) for e in parsed.unmanaged_pname_rules()],
+        "unmanaged": [c for _, c in parsed.unmanaged_rules()],
+    }
+
+
+def write_cache(view):
+    """把名单写入 0644 的缓存文件，供非 root 的 list / rules / GUI 读取。只含进程名规则。"""
+    try:
+        data = dict(view)
+        data.pop("unmanaged", None)
+        data["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+        os.makedirs(state_dir(), mode=0o755, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=state_dir(), prefix=".rules.", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, cache_path())
+    except OSError:
+        pass
+
+
+def load_rules_view():
+    """返回 (view 或 None, 来源说明)。"""
+    try:
+        text, _ = read_config_text()
+        view = rules_view_from_parsed(Parsed(text))
+        view["source"] = "config"
+        if os.geteuid() == 0:
+            write_cache(view)
+        return view, None
+    except PermissionError:
+        pass
+    except (OSError, ProxyctlError) as e:
+        return None, "无法读取配置：%s" % e
+    try:
+        with open(cache_path(), "r", encoding="utf-8") as f:
+            view = json.load(f)
+        view["source"] = "cache"
+        return view, "（非 root：配置文件不可读，规则来自 %s 缓存，更新于 %s）" % (cache_path(), view.get("updated", "?"))
+    except (OSError, ValueError):
+        return None, "（非 root：配置文件不可读，也没有规则缓存。以 sudo 运行可看到规则。）"
+
+
+def status_of(name, view):
+    if view is None:
+        return STATUS_UNKNOWN
+    safety = {n: o for n, o in view.get("safety", [])}
+    if name in view.get("proxy", []) or safety.get(name) == "proxy":
+        return STATUS_PROXY
+    if name in view.get("direct", []) or safety.get(name) == "must_direct":
+        return STATUS_DIRECT
+    for n, o in view.get("unmanaged_pname", []):
+        if n == name:
+            return "其他规则(%s)" % o
+    return STATUS_DEFAULT
+
+
+# ---------------------------------------------------------------------------
+# 事务：锁 → 备份 → 临时文件 → validate → rename → reload → 确认 active
+# ---------------------------------------------------------------------------
+
+
+class FileLock(object):
+    def __init__(self, path, timeout):
+        self.path = path
+        self.timeout = timeout
+        self.fd = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), mode=0o755, exist_ok=True)
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    os.close(self.fd)
+                    self.fd = None
+                    raise ProxyctlError("另一个 proxyctl 正在修改配置（锁文件 %s），等待 %.0f 秒后仍未释放，已放弃。"
+                                        % (self.path, self.timeout))
+                time.sleep(0.1)
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+            self.fd = None
+
+
+BACKUP_RE = re.compile(r"^config-\d{8}-\d{6}-\d{6}-[a-z-]+\.dae$")
+BACKUP_KEEP = 30
+
+
+def make_backup(data, opname):
+    d = backup_dir()
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    name = "config-%s-%s.dae" % (stamp, re.sub(r"[^a-z-]", "", opname) or "op")
+    path = os.path.join(d, name)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    prune_backups()
+    return path
+
+
+def list_backups():
+    try:
+        names = [n for n in os.listdir(backup_dir()) if BACKUP_RE.match(n)]
+    except FileNotFoundError:
+        return []
+    return sorted(names)
+
+
+def prune_backups():
+    names = list_backups()
+    for n in names[:-BACKUP_KEEP] if len(names) > BACKUP_KEEP else []:
+        try:
+            os.unlink(os.path.join(backup_dir(), n))
+        except OSError:
+            pass
+
+
+def _fsync_dir(d):
+    try:
+        fd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def write_temp(data):
+    """在目标同目录生成临时文件（root:root 0600；非 root 测试时保持当前用户）。
+    dae 要求配置文件以 .dae 结尾，所以临时文件也用 .dae 后缀。"""
+    target = config_path()
+    d = os.path.dirname(os.path.abspath(target))
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".proxyctl-tmp-", suffix=".dae")
+    try:
+        os.fchmod(fd, 0o600)
+        if os.geteuid() == 0:
+            os.fchown(fd, 0, 0)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return tmp
+
+
+def install_file(tmp):
+    target = config_path()
+    os.replace(tmp, target)
+    _fsync_dir(os.path.dirname(os.path.abspath(target)))
+
+
+def transact(opname, compute):
+    """执行一次写配置事务。compute(旧文本) -> (新文本, 消息)。返回退出码。"""
+    target = config_path()
+    with FileLock(lock_path(), lock_timeout()):
+        try:
+            old_text, old_bytes = read_config_text()
+        except PermissionError:
+            raise ProxyctlError("没有权限读取 %s，请用 sudo 运行。" % target)
+        except FileNotFoundError:
+            raise ProxyctlError("找不到配置文件 %s。" % target)
+        new_text, msgs = compute(old_text)
+        for m in msgs:
+            print(m)
+        if new_text == old_text:
+            print("配置无变化，未写入，也未重新加载 dae。")
+            write_cache(rules_view_from_parsed(Parsed(new_text)))
+            return 0
+        new_bytes = new_text.encode("utf-8")
+        backup = make_backup(old_bytes, opname)
+        print("已备份原配置：%s" % backup)
+
+        tmp = write_temp(new_bytes)
+        rc, out = dae_validate(tmp)
+        if rc != 0:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise ProxyctlError("新配置未通过 dae validate，已放弃修改，原配置保持不变。\ndae 输出：\n%s"
+                                % out.strip())
+
+        was_active = service_active()
+        reloaded = False
+        try:
+            install_file(tmp)
+            tmp = None
+            if was_active:
+                reloaded = True
+                rc, out = service_reload()
+                if rc != 0:
+                    raise ProxyctlError("systemctl reload %s 失败：%s" % (service_name(), out.strip()))
+                ok, state = wait_still_active(reload_settle())
+                if not ok:
+                    raise ProxyctlError("reload 后 %s 服务状态为“%s”，不是 active。" % (service_name(), state))
+        except BaseException as e:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            detail = rollback(old_bytes, reloaded)
+            if isinstance(e, ProxyctlError):
+                raise ProxyctlError("%s\n%s\n备份文件：%s" % (e, detail, backup))
+            raise ProxyctlError("写入配置时发生意外错误：%r\n%s\n备份文件：%s" % (e, detail, backup))
+
+        write_cache(rules_view_from_parsed(Parsed(new_text)))
+        if was_active:
+            print("配置已通过校验并生效（dae 已 reload，仍为 active）。")
+            print("注意：dae 重新加载会断开所有正在走代理的连接，名单中正在运行的程序会自动重连。"
+                  "Signal 重连较慢，可能显示离线几十秒到 1～2 分钟；想立刻恢复，可从托盘退出 Signal 再重新打开。")
+        else:
+            print("配置已通过校验并写入。注意：dae 当前未运行（状态：%s），配置将在 dae 下次启动时生效；"
+                  "在此之前名单中的程序会直接连接外网。" % service_state())
+        return 0
+
+
+def rollback(old_bytes, reloaded):
+    """恢复旧配置；如已 reload 则再次 reload。返回说明文字。"""
+    lines = ["正在自动回滚……"]
+    try:
+        tmp = write_temp(old_bytes)
+        install_file(tmp)
+        lines.append("已恢复原配置文件。")
+    except Exception as e:  # noqa
+        lines.append("严重：恢复原配置文件失败（%r）！请立即执行 proxyctl restore 手工恢复。" % (e,))
+        return "\n".join(lines)
+    if reloaded:
+        rc, out = service_reload()
+        ok, state = wait_still_active(reload_settle())
+        if rc == 0 and ok:
+            lines.append("已再次 reload，dae 已恢复为原配置并处于 active。")
+        else:
+            lines.append("再次 reload 后 dae 状态为“%s”%s。请检查：journalctl -u %s -e ；必要时 sudo systemctl restart %s。"
+                         "在 dae 恢复之前，名单中的程序会直接连接外网（故障即放行）。"
+                         % (state, ("，reload 输出：" + out.strip()) if rc != 0 else "",
+                            service_name(), service_name()))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 提权
+# ---------------------------------------------------------------------------
+
+
+def can_write_config():
+    target = config_path()
+    d = os.path.dirname(os.path.abspath(target))
+    sd = state_dir()
+    sd_ok = os.access(sd, os.W_OK) if os.path.exists(sd) else os.access(os.path.dirname(sd.rstrip("/")) or "/", os.W_OK)
+    return os.access(d, os.W_OK) and os.access(target, os.R_OK | os.W_OK) and sd_ok
+
+
+def ensure_root(argv, need):
+    """需要 root 且当前不能直接完成时：终端里用 sudo 重新执行自身，否则报错。"""
+    if os.geteuid() == 0 or not need():
+        return
+    hint = "此操作需要 root 权限，请执行：sudo proxyctl %s" % " ".join(argv)
+    if os.environ.get("PROXYCTL_NO_ESCALATE"):
+        raise ProxyctlError(hint)
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        raise ProxyctlError(hint)
+    envs = ["%s=%s" % (k, v) for k, v in sorted(os.environ.items()) if k.startswith("PROXYCTL_")]
+    me = os.path.realpath(sys.argv[0])
+    cmd = [sudo_bin(), "--"]
+    if envs:
+        cmd += ["env"] + envs
+    cmd += [sys.executable, me] + list(argv)
+    print("需要 root 权限，正在通过 sudo 重新执行……", file=sys.stderr)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        os.execvp(cmd[0], cmd)
+    except OSError as e:
+        raise ProxyctlError("无法执行 sudo：%s。%s" % (e, hint))
+
+
+# ---------------------------------------------------------------------------
+# 输出辅助
+# ---------------------------------------------------------------------------
+
+_TTY = sys.stdout.isatty()
+
+
+def color(text, code):
+    return "\033[%sm%s\033[0m" % (code, text) if _TTY and not os.environ.get("NO_COLOR") else text
+
+
+def disp_width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def pad(s, width):
+    return s + " " * max(0, width - disp_width(s))
+
+
+def table(headers, rows):
+    widths = [disp_width(h) for h in headers]
+    for r in rows:
+        for i, c in enumerate(r[:-1]):
+            widths[i] = max(widths[i], disp_width(c))
+    out = ["  ".join(pad(h, widths[i]) if i < len(headers) - 1 else h for i, h in enumerate(headers))]
+    for r in rows:
+        out.append("  ".join(pad(c, widths[i]) if i < len(r) - 1 else c for i, c in enumerate(r)))
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# 命令实现
+# ---------------------------------------------------------------------------
+
+
+def cmd_init(args):
+    return transact("init", op_init)
+
+
+def cmd_add(args):
+    name = args.name
+    validate_name(name)
+    if is_blacklisted(name):
+        raise ProxyctlError("拒绝加入代理名单。" + blacklist_reason(name))
+    if not process_running(name):
+        print("警告：当前没有名为“%s”的进程在运行（这不影响添加，但请确认名字写对了）。" % name)
+    rc = transact("add", lambda t: op_add(t, name))
+    print("提示：请以 dae 日志中实际显示的进程名为准（journalctl -u dae -f 中的 pname），"
+          "例如 Electron 应用的联网进程名可能与启动命令不同。")
+    return rc
+
+
+def cmd_remove(args):
+    return transact("remove", lambda t: op_remove(t, args.name))
+
+
+def cmd_protect(args):
+    return transact("protect", lambda t: op_protect(t, args.name))
+
+
+def cmd_unprotect(args):
+    return transact("unprotect", lambda t: op_unprotect(t, args.name))
+
+
+def cmd_rules(args):
+    view, note = load_rules_view()
+    if view is None:
+        print(note)
+        return 1
+    if note:
+        print(note)
+    if not view.get("initialized"):
+        print("尚未初始化：配置中没有 proxyctl 管理区块。请执行 sudo proxyctl init。")
+    print("【安全区块】（固定，不可删除）")
+    for n, o in view.get("safety", []):
+        print("  pname(%s) -> %s" % (n, o))
+    print("【直连保护】must_direct（%d 条）" % len(view.get("direct", [])))
+    for n in view.get("direct", []):
+        print("  %s" % n)
+    print("【代理名单】proxy（%d 条）" % len(view.get("proxy", [])))
+    for n in view.get("proxy", []):
+        flag = "   ← 警告：通用运行时名称，建议 remove" if is_blacklisted(n) else ""
+        print("  %s%s" % (n, flag))
+    print("【routing 中不受 proxyctl 管理的规则】")
+    if view.get("source") == "cache":
+        for n, o in view.get("unmanaged_pname", []):
+            print("  pname(%s) -> %s" % (n, o))
+        print("  （缓存中只记录进程名规则；其余规则请用 sudo proxyctl rules 查看）")
+    else:
+        for c in view.get("unmanaged", []):
+            print("  %s" % c)
+    return 0
+
+
+def list_rows(view):
+    """联网进程（ss 快照）加上代理名单程序中未代理的子进程。"""
+    rows = []
+    for a in collect_connections():
+        rows.append({"name": a["name"], "pids": len(a["pids"]), "conns": a["conns"],
+                     "samples": list(a["samples"]), "status": status_of(a["name"], view)})
+    kids = unproxied_children(view)
+    by_name = {r["name"]: r for r in rows}
+    for name in sorted(kids):
+        parent = "父进程：%s" % "、".join(sorted(kids[name]["parents"]))
+        if name in by_name:
+            by_name[name]["status"] = STATUS_CHILD
+            by_name[name]["samples"].insert(0, parent)
+        else:
+            rows.append({"name": name, "pids": len(kids[name]["pids"]), "conns": 0,
+                         "samples": [parent], "status": STATUS_CHILD})
+    return rows
+
+
+def _list_rows():
+    view, note = load_rules_view()
+    return list_rows(view), view, note
+
+
+def gui_recent_seconds():
+    try:
+        return max(0.0, float(_env("PROXYCTL_GUI_RECENT", "300")))
+    except ValueError:
+        return 300.0
+
+
+def merge_recent(history, rows, now, keep):
+    """GUI 用：把最近 keep 秒内出现过、但当前快照中已消失的进程保留在表格中。
+
+    短连接（登录、检查更新）常常落在两次快照之间，保留一段时间能多抓住一些。
+    history 为 {进程名: (行, 最后出现时间)}，会被原地更新。
+    被保留的行 conns 为 0，并带有 "gone" 字段（已消失的秒数）。
+    """
+    names = set()
+    for r in rows:
+        names.add(r["name"])
+        if r["conns"] > 0:
+            history[r["name"]] = (dict(r), now)
+    out = list(rows)
+    for name, (r, seen) in sorted(history.items()):
+        if name in names:
+            continue
+        age = now - seen
+        if age > keep:
+            del history[name]
+            continue
+        old = dict(r)
+        old["conns"] = 0
+        old["gone"] = age
+        out.append(old)
+    return out
+
+
+def gone_text(age):
+    return "刚刚断开" if age < 60 else "%d 分钟前断开" % int(age // 60)
+
+
+CHILD_NOTE = ("“未代理子进程”：代理名单中某个程序启动的子进程，名字不同，所以不会走代理。"
+              "它们常常只在登录、同步时短暂联网，列表里不一定能看到连接；"
+              "如果该应用出现地区限制或连接失败，请把它也加入代理名单：proxyctl add <进程名>")
+
+
+def _nonroot_note():
+    if os.geteuid() != 0:
+        return "注意：以非 root 运行时，ss 只能显示当前用户自己的进程；其他用户/系统服务的连接会显示为“(未知进程)”或不显示。"
+    return None
+
+
+def cmd_list(args):
+    rows, view, note = _list_rows()
+    for n in (_nonroot_note(), note):
+        if n:
+            print(n)
+    if not rows:
+        print("当前没有连接外网的进程（已排除回环和局域网地址），代理名单中的程序也没有未代理的子进程。")
+        return 0
+    print(table(["进程名", "PID数", "连接数", "状态", "远端示例"],
+                [[r["name"], str(r["pids"]), str(r["conns"]), r["status"], ", ".join(r["samples"])]
+                 for r in rows]))
+    if any(r["status"] == STATUS_CHILD for r in rows):
+        print(CHILD_NOTE)
+    return 0
+
+
+def cmd_pick(args):
+    rows, view, note = _list_rows()
+    for n in (_nonroot_note(), note):
+        if n:
+            print(n)
+    rows = [r for r in rows if r["name"] != "(未知进程)"]
+    if not rows:
+        print("当前没有可选择的联网进程，代理名单中的程序也没有未代理的子进程。")
+        return 0
+    print(table(["编号", "进程名", "PID数", "连接数", "状态", "远端示例"],
+                [[str(i + 1), r["name"], str(r["pids"]), str(r["conns"]), r["status"], ", ".join(r["samples"])]
+                 for i, r in enumerate(rows)]))
+    if any(r["status"] == STATUS_CHILD for r in rows):
+        print(CHILD_NOTE)
+    try:
+        choice = input("请输入要加入代理名单的编号（直接回车取消）：").strip()
+    except EOFError:
+        choice = ""
+    if not choice:
+        print("已取消。")
+        return 0
+    if not choice.isdigit() or not 1 <= int(choice) <= len(rows):
+        raise ProxyctlError("无效的编号：%s" % choice)
+    name = rows[int(choice) - 1]["name"]
+    validate_name(name)
+    if is_blacklisted(name):
+        raise ProxyctlError("拒绝加入代理名单。" + blacklist_reason(name))
+    if rows[int(choice) - 1]["status"] == STATUS_PROXY:
+        print("“%s”已经在代理名单中。" % name)
+        return 0
+    try:
+        ans = input("确认把“%s”加入代理名单？[y/N] " % name).strip().lower()
+    except EOFError:
+        ans = ""
+    if ans not in ("y", "yes"):
+        print("已取消。")
+        return 0
+    return main(["add", name])
+
+
+# -- check -------------------------------------------------------------------
+
+
+class Checker(object):
+    def __init__(self, quiet):
+        self.quiet = quiet
+        self.results = []
+        self.slow = None  # 代理链路“很慢”的说明（需要单独提醒，但不算故障）
+
+    def add(self, level, msg):
+        self.results.append((level, msg))
+        if self.quiet and level not in ("WARN", "FAIL"):
+            return
+        tag = {"OK": color("[ OK ]", "32"), "WARN": color("[WARN]", "33"),
+               "FAIL": color("[FAIL]", "1;31"), "INFO": "[INFO]", "SKIP": "[SKIP]"}[level]
+        if level == "FAIL":
+            msg = color(msg, "1;31")
+        print("%s %s" % (tag, msg))
+
+    def fails(self):
+        return [m for l, m in self.results if l == "FAIL"]
+
+    def exit_code(self):
+        levels = {l for l, _ in self.results}
+        return 2 if "FAIL" in levels else (1 if "WARN" in levels else 0)
+
+
+def listener_process():
+    """用 ss 找出 SOCKS 端口的监听进程；返回描述字符串或 None。"""
+    host, port = socks_addr()
+    rc, out = run_cmd([ss_bin(), "-ltnpH"], timeout=15)
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        local = parts[3]
+        _, p = split_addr(local)
+        if p == str(port):
+            procs = SS_USERS_RE.findall(" ".join(parts[5:]))
+            if procs:
+                return ", ".join("%s(pid %s)" % (n, pid) for n, pid in procs)
+            return "未知进程（非 root 看不到其他用户的进程）"
+    return None
+
+
+def default_route_ifaces():
+    ifaces = set()
+    try:
+        with open("/proc/net/route") as f:
+            for line in f.readlines()[1:]:
+                p = line.split()
+                if len(p) > 2 and p[1] == "00000000":
+                    ifaces.add(p[0])
+    except OSError:
+        pass
+    try:
+        with open("/proc/net/ipv6_route") as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 10 and p[0] == "0" * 32 and p[1] == "00" and p[9] != "lo":
+                    ifaces.add(p[9])
+    except OSError:
+        pass
+    return ifaces
+
+
+def global_ipv6(ifaces):
+    found = []
+    try:
+        with open("/proc/net/if_inet6") as f:
+            for line in f:
+                p = line.split()
+                if len(p) < 6 or p[5] not in ifaces or p[3] != "00":
+                    continue
+                ip = ipaddress.ip_address(":".join(p[0][i:i + 4] for i in range(0, 32, 4)))
+                if ip in ipaddress.ip_network("2000::/3"):
+                    found.append((p[5], str(ip)))
+    except OSError:
+        pass
+    return found
+
+
+def probe_url():
+    return _env("PROXYCTL_PROBE_URL", "https://www.gstatic.com/generate_204")
+
+
+def chain_interval():
+    """链路正常时两次探测的最小间隔（秒）；失败后每次检查都会复查。"""
+    try:
+        return max(0.0, float(_env("PROXYCTL_CHAIN_INTERVAL", "120")))
+    except ValueError:
+        return 120.0
+
+
+def chain_state_path():
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "proxyctl-chain.json")
+
+
+def load_chain_state():
+    try:
+        with open(chain_state_path()) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def probe_chain():
+    """真正经 SOCKS5 发一个很小的请求，确认 xray → 节点 → 外网 整条链路可用。
+    只要拿到 HTTP 响应就算通（curl 不带 -f 时，任何 HTTP 状态码都返回 0）。"""
+    t0 = time.monotonic()
+    rc, out = run_cmd([curl_bin(), "-x", "socks5h://%s" % socks_str(), "-sS", "-o", "/dev/null",
+                       "-w", "%{http_code}", "--max-time", "15", probe_url()],
+                      timeout=25, env=_clean_env())
+    elapsed = time.monotonic() - t0
+    if rc == 0:
+        return True, "HTTP %s，耗时 %.1f 秒" % (out.strip()[-3:], elapsed), elapsed
+    return False, "curl 退出码 %d：%s" % (rc, out.strip()[:160]), elapsed
+
+
+def slow_seconds():
+    """单次链路探测超过这个秒数记为“偏慢”。"""
+    try:
+        return max(0.0, float(_env("PROXYCTL_SLOW_SECONDS", "3")))
+    except ValueError:
+        return 3.0
+
+
+SLOW_STREAK = 3  # 连续这么多次偏慢才警告（换节点后第一次连接本来就可能要几秒）
+
+
+CHAIN_FAIL = ("代理链路不通：dae、SOCKS5 端口和 xray 都在运行，但经 SOCKS5 连续无法访问外网"
+              "（节点不可达、线路被阻断或 v2rayN 配置有误）。名单中的程序此刻无法联网（故障即断开）。"
+              "请在 v2rayN 中测试或更换节点。")
+
+
+def check_chain(ck, use_cache):
+    """链路探测。use_cache=True（定时器）时，最近一次探测成功、不慢且未超过间隔就不重复探测。
+    连续 2 次失败才判 FAIL，避免节点偶发抖动误报；FAIL 文案固定，保证通知去重有效。
+    连续 SLOW_STREAK 次成功但耗时超过 slow_seconds() 时给出“很慢”警告（ck.slow），
+    因为节点很慢时 Signal 这类维持长连接的应用会反复显示离线，而普通检查全部正常。"""
+    last = load_chain_state()
+    now = time.time()
+    age = now - last.get("time", 0)
+    if use_cache and last.get("ok") and not last.get("slow") and 0 <= age < chain_interval():
+        ck.add("OK", "代理链路正常（%d 秒前探测，耗时 %.1f 秒）。" % (age, last.get("elapsed", 0)))
+        return
+    ok, detail, elapsed = probe_chain()
+    fails = 0 if ok else int(last.get("fails", 0)) + 1
+    is_slow = ok and elapsed > slow_seconds()
+    slow = int(last.get("slow", 0)) + 1 if is_slow else 0
+    try:
+        os.makedirs(os.path.dirname(chain_state_path()), exist_ok=True)
+        with open(chain_state_path(), "w") as f:
+            json.dump({"ok": ok, "time": now, "fails": fails, "slow": slow, "elapsed": round(elapsed, 2),
+                       "detail": detail}, f, ensure_ascii=False)
+    except OSError:
+        pass
+    if not ok:
+        if fails >= 2:
+            ck.add("FAIL", CHAIN_FAIL)
+        else:
+            ck.add("WARN", "代理链路探测失败 1 次（%s），稍后复查；连续失败才会报警。" % detail)
+    elif slow >= SLOW_STREAK:
+        ck.slow = ("代理链路很慢：连续 %d 次经 SOCKS5 访问外网都超过 %g 秒（最近一次 %.1f 秒，正常应在 1 秒左右）。"
+                   "Signal 等需要保持长连接的应用可能反复显示离线。建议在 v2rayN 中测试延迟并更换节点。"
+                   % (slow, slow_seconds(), elapsed))
+        ck.add("WARN", ck.slow)
+    elif slow:
+        ck.add("OK", "代理链路可用但偏慢（%s，连续第 %d 次），继续观察。" % (detail, slow))
+    else:
+        ck.add("OK", "代理链路正常：经 SOCKS5 访问 %s 成功（%s）。" % (probe_url(), detail))
+
+
+def check_basic(ck, chain_cache=False):
+    state = service_state()
+    if state == "active":
+        ck.add("OK", "dae 服务正在运行（active）。")
+    else:
+        ck.add("FAIL", "dae 服务未运行（状态：%s）！代理名单里的程序此刻会直接连接外网（故障即放行）。"
+                       "请执行：sudo systemctl start dae" % state)
+    listening = socks_listening()
+    if listening:
+        who = listener_process()
+        ck.add("OK", "SOCKS5 %s 正在监听%s。" % (socks_str(), ("，监听进程：" + who) if who else ""))
+    else:
+        ck.add("FAIL", "SOCKS5 %s 没有在监听！名单中的程序将无法联网（故障即断开）。请检查 v2rayN / xray。"
+               % socks_str())
+    procs = running_processes()
+    cores = ["%s(pid %s)" % (n, ",".join(str(p) for p in sorted(procs[n]))) for n in CORE_NAMES if n in procs]
+    if cores:
+        ck.add("OK", "代理核心进程：%s" % "、".join(cores))
+    elif listening:
+        ck.add("WARN", "没有找到 xray / sing-box / mihomo 进程，但 %s 有程序在监听；"
+                       "请确认监听者是代理核心且已在安全区块中直连。" % socks_str())
+    else:
+        ck.add("FAIL", "没有找到 xray / sing-box / mihomo 进程（代理核心未运行）。")
+    if state == "active" and listening:
+        check_chain(ck, chain_cache)
+    else:
+        # dae 或端口已经报了 FAIL，链路探测没有意义；清掉旧状态，恢复后重新计数
+        try:
+            os.unlink(chain_state_path())
+        except OSError:
+            pass
+
+
+def check_config(ck):
+    target = config_path()
+    try:
+        st = os.stat(target)
+    except OSError as e:
+        ck.add("FAIL", "无法访问配置文件 %s：%s" % (target, e.strerror))
+        return
+    mode = st.st_mode & 0o7777
+    if st.st_uid == 0 and mode & 0o037 == 0 and mode & 0o600 == 0o600:
+        ck.add("OK", "配置文件权限正确：root 所有，%04o。" % mode)
+    else:
+        ck.add("FAIL", "配置文件权限不符合 dae 要求：属主 uid=%d，权限 %04o（应为 root 所有、0600 或 0640，"
+                       "否则 dae 拒绝加载）。" % (st.st_uid, mode))
+    try:
+        text, _ = read_config_text()
+    except PermissionError:
+        ck.add("SKIP", "当前不是 root，无法读取配置：跳过 validate、安全区块、名单、dial_mode 检查。"
+                       "以 sudo 运行可获得完整检查（sudo proxyctl check）。")
+        view, _ = load_rules_view()
+        if view:
+            bad = [n for n in view.get("proxy", []) if is_blacklisted(n)]
+            for n in bad:
+                ck.add("WARN", "（来自缓存）代理名单包含通用运行时名称“%s”，建议执行 proxyctl remove %s。" % (n, n))
+        return
+    except (OSError, ProxyctlError) as e:
+        ck.add("FAIL", "无法读取配置：%s" % e)
+        return
+    ck.add("OK", "配置文件可读取。")
+    rc, out = dae_validate(target)
+    if rc == 0:
+        ck.add("OK", "配置通过 dae validate。")
+    else:
+        ck.add("FAIL", "配置未通过 dae validate：%s" % out.strip())
+    try:
+        parsed = Parsed(text)
+    except ProxyctlError as e:
+        ck.add("FAIL", "配置结构解析失败：%s" % e)
+        return
+    if not parsed.initialized:
+        ck.add("FAIL", "配置中没有 proxyctl 管理区块，安全区块缺失。请执行 sudo proxyctl init。")
+    elif parsed.safety_complete():
+        ck.add("OK", "安全区块完整。")
+    else:
+        ck.add("FAIL", "安全区块不完整或顺序被改动。请执行 sudo proxyctl init 修复。")
+    socks_nodes = config_socks_addrs(text)
+    if socks_nodes and socks_str() not in socks_nodes:
+        ck.add("WARN", "dae 配置中的 SOCKS5 节点是 %s，而 proxyctl 检查的是 %s。"
+                       "请在 %s 中设置 socks = 实际地址，否则 check / test 的结果不准。"
+               % ("、".join(sorted(socks_nodes)), socks_str(), conf_path()))
+    before = parsed.rules_before_safety()
+    if before:
+        ck.add("WARN", "routing 中有 %d 条规则排在安全区块之前（首条命中生效，可能覆盖安全规则）：%s"
+               % (len(before), "；".join(before)))
+    if os.geteuid() == 0:
+        write_cache(rules_view_from_parsed(parsed))
+    bad = [n for n in parsed.names("proxy") if is_blacklisted(n)]
+    if bad:
+        for n in bad:
+            ck.add("WARN", "代理名单包含通用运行时名称“%s”：会把所有同名程序一起代理。建议执行 proxyctl remove %s，"
+                           "改用应用自身的代理设置。" % (n, n))
+    elif parsed.initialized:
+        ck.add("OK", "代理名单中没有通用运行时名称。")
+    for n in parsed.names("proxy") + parsed.names("direct"):
+        w = long_name_warning(n)
+        if w:
+            ck.add("WARN", w)
+    dial = parsed.global_value("dial_mode")
+    ck.add("INFO", "dial_mode：%s（仅展示，proxyctl 不做 DNS 相关修改）" % (dial if dial else "未设置（默认 domain）"))
+    resolve = [o for n, o in parsed.unmanaged_pname_rules() + parsed.entries["direct"] + parsed.entries["safety"]
+               if n.startswith("systemd-resolve")]
+    ck.add("INFO", "systemd-resolve 的 must_direct 规则：%s（仅展示）"
+           % ("存在" if "must_direct" in resolve else "不存在"))
+
+
+def check_extra(ck):
+    pol = service_restart_policy()
+    if pol is None:
+        ck.add("WARN", "无法读取 dae 服务的 Restart 策略。")
+    elif pol == "on-failure":
+        ck.add("OK", "dae 服务 Restart=%s。" % pol)
+    else:
+        ck.add("WARN", "dae 服务 Restart=%s，建议为 on-failure（install.sh 会添加 systemd drop-in）。" % pol)
+    ifaces = extra_ifaces() | default_route_ifaces()
+    v6 = global_ipv6(ifaces)
+    if v6:
+        ck.add("WARN", "接口 %s 有全局 IPv6 地址（%s）。请单独测试 IPv6 下代理是否生效，"
+                       "例如：%s -6 -sS --max-time 10 %s"
+               % ("、".join(sorted({i for i, _ in v6})), "、".join(a for _, a in v6[:2]),
+                  os.path.join(lib_dir(), "proxyctl-probe"), test_url()))
+    elif ifaces:
+        ck.add("OK", "%s 没有全局 IPv6 地址。" % "、".join(sorted(ifaces)))
+    else:
+        ck.add("OK", "没有找到默认路由接口，跳过 IPv6 检查。")
+
+
+def _notify_state_path():
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "proxyctl-notify.json")
+
+
+def maybe_notify(fails):
+    """有 FAIL 时弹通知；同一组故障 10 分钟内只提醒一次，避免定时器反复刷屏。
+    曾经提醒过故障、现在恢复正常时，再发一条“已恢复”通知。"""
+    path = _notify_state_path()
+    sig = "\n".join(fails)
+    now = time.time()
+    try:
+        with open(path) as f:
+            last = json.load(f)
+    except (OSError, ValueError):
+        last = {}
+    if not fails:
+        if last:
+            notify("proxyctl：代理已恢复正常",
+                   "dae、SOCKS5 %s 与代理链路均已恢复，代理名单中的程序重新走代理。"
+                   "故障期间如有程序直连，可执行 proxyctl test 复查。" % socks_str(), urgency="normal")
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return
+    if last.get("sig") == sig and now - last.get("time", 0) < 600:
+        return
+    notify("proxyctl：代理故障", "\n".join(fails)[:500])
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"sig": sig, "time": now}, f)
+    except OSError:
+        pass
+
+
+def maybe_notify_slow(message):
+    """链路很慢时弹一条普通级别的通知，30 分钟内只提醒一次；速度恢复后清除状态。"""
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.path.join(os.path.expanduser("~"), ".cache")
+    path = os.path.join(base, "proxyctl-slow.json")
+    if not message:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return
+    try:
+        with open(path) as f:
+            last = json.load(f)
+    except (OSError, ValueError):
+        last = {}
+    if time.time() - last.get("time", 0) < 1800:
+        return
+    notify("proxyctl：代理很慢", message, urgency="normal")
+    try:
+        os.makedirs(base, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"time": time.time()}, f)
+    except OSError:
+        pass
+
+
+def cmd_check(args):
+    ck = Checker(args.quiet)
+    check_basic(ck, chain_cache=args.basic)
+    if not args.basic:
+        check_config(ck)
+        check_extra(ck)
+    if args.notify:
+        maybe_notify(ck.fails())
+        maybe_notify_slow(None if ck.fails() else ck.slow)
+    if not args.quiet:
+        n = {l: sum(1 for x, _ in ck.results if x == l) for l in ("OK", "WARN", "FAIL")}
+        print("汇总：OK %d，WARN %d，FAIL %d" % (n["OK"], n["WARN"], n["FAIL"]))
+    return ck.exit_code()
+
+
+# -- test --------------------------------------------------------------------
+
+
+def _clean_env():
+    env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
+    return env
+
+
+def test_retries():
+    try:
+        return max(1, int(_env("PROXYCTL_TEST_RETRIES", "3")))
+    except ValueError:
+        return 3
+
+
+def _curl_once(argv):
+    # 注意：--noproxy '*' 会让 curl 连 -x 指定的代理也一起忽略，所以只在不带 -x 时使用。
+    extra = [] if "-x" in argv else ["--noproxy", "*"]
+    rc, out = run_cmd(argv + ["-sS", "--max-time", "10"] + extra + [test_url()],
+                      timeout=20, env=_clean_env())
+    text = out.strip()
+    if rc != 0:
+        return None, "curl 退出码 %d：%s" % (rc, text[:200])
+    try:
+        return str(ipaddress.ip_address(text)), None
+    except ValueError:
+        return None, "返回内容不是 IP 地址：%s" % text[:200]
+
+
+def _curl_ip(argv):
+    """最多尝试 test_retries() 次，避免节点偶发抖动造成误报。
+    返回 (ip 或 None, 错误说明, 附加说明列表)。"""
+    errors = []
+    for attempt in range(1, test_retries() + 1):
+        ip, err = _curl_once(argv)
+        if ip:
+            notes = []
+            if errors:
+                notes.append("第 %d 次尝试才成功（之前：%s）。偶发失败通常是节点或 xray 抖动。"
+                             % (attempt, "；".join(errors)))
+            return ip, None, notes
+        errors.append(err)
+    return None, "%s（共尝试 %d 次）" % (errors[-1], len(errors)), []
+
+
+def speed_samples():
+    try:
+        return max(1, int(_env("PROXYCTL_SPEED_SAMPLES", "5")))
+    except ValueError:
+        return 5
+
+
+def connect_slow_seconds():
+    """新建一条代理连接的中位耗时超过这个秒数，test 给出“新连接慢”警告。"""
+    try:
+        return max(0.0, float(_env("PROXYCTL_CONNECT_SLOW", "1.5")))
+    except ValueError:
+        return 1.5
+
+
+def measure_new_connections():
+    """连续新开 speed_samples() 条经 SOCKS5 的连接（每次一个独立 curl，不复用），返回
+    (成功耗时列表, 失败次数)。v2rayN 的延迟测试反映的是已建好连接上的一次请求，
+    节点“新建连接很慢”时它仍显示几百毫秒，而 Claude 这类频繁新开连接的应用会反复超时重试。"""
+    times, failures = [], 0
+    for _ in range(speed_samples()):
+        t0 = time.monotonic()
+        rc, _out = run_cmd([curl_bin(), "-x", "socks5h://%s" % socks_str(), "-sS", "-o", "/dev/null",
+                            "--max-time", "15", probe_url()], timeout=25, env=_clean_env())
+        if rc == 0:
+            times.append(time.monotonic() - t0)
+        else:
+            failures += 1
+    return times, failures
+
+
+def sysfs_net():
+    return _env("PROXYCTL_SYSFS_NET", "/sys/class/net")
+
+
+def tun_interfaces():
+    """本机现有的 TUN 网卡（有 tun_flags 的接口），例如 v2rayN TUN 模式的 singbox_tun。"""
+    try:
+        names = sorted(os.listdir(sysfs_net()))
+    except OSError:
+        return []
+    return [n for n in names if os.path.exists(os.path.join(sysfs_net(), n, "tun_flags"))]
+
+
+def cmd_test(args):
+    results = []
+    warnings = []
+
+    def report(ok, title, detail):
+        results.append(ok)
+        tag = color("[PASS]", "32") if ok else color("[FAIL]", "1;31")
+        print("%s %s" % (tag, title))
+        for line in detail:
+            print("       %s" % line)
+
+    def warn(title, detail):
+        warnings.append(title)
+        print("%s %s" % (color("[WARN]", "33"), title))
+        for line in detail:
+            print("       %s" % line)
+
+    state = service_state()
+    print("dae 服务状态：%s；SOCKS5 %s：%s" % (state, socks_str(), "监听中" if socks_listening() else "未监听"))
+
+    url = test_url()
+    proxy_ip, err, notes = _curl_ip([curl_bin(), "-x", "socks5h://%s" % socks_str()])
+    if proxy_ip:
+        report(True, "1. 通过 SOCKS5 直接访问 %s，得到代理出口 IP：%s" % (url, proxy_ip),
+               ["说明 v2rayN/xray 与远程节点工作正常。"] + notes)
+    else:
+        report(False, "1. 通过 SOCKS5 %s 访问 %s 失败" % (socks_str(), url),
+               [err, "说明 xray 未运行、节点不可用或 SOCKS 端口不对。此时名单中的程序无法联网（故障即断开）。"])
+
+    probe = os.path.join(lib_dir(), "proxyctl-probe")
+    direct = os.path.join(lib_dir(), "proxyctl-direct")
+
+    if not os.access(probe, os.X_OK):
+        report(False, "2. 找不到 %s" % probe, ["请先执行 sudo ./install.sh。"])
+        probe_ip = None
+    else:
+        probe_ip, err, notes = _curl_ip([probe])
+        if probe_ip is None:
+            report(False, "2. proxyctl-probe（不设代理，依靠 dae 按进程名分流）访问失败",
+                   [err, "dae 已把它送进代理，但代理链路不通；或 dae 工作异常。"])
+        elif proxy_ip is None:
+            report(False, "2. proxyctl-probe 得到 %s，但第 1 步失败，无法比较" % probe_ip, [])
+        elif probe_ip == proxy_ip:
+            report(True, "2. proxyctl-probe 得到 %s，与代理出口一致" % probe_ip,
+                   ["说明 dae 按进程名把名单程序送进了代理。"] + notes)
+        else:
+            report(False, "2. proxyctl-probe 得到 %s，与代理出口 %s 不一致" % (probe_ip, proxy_ip),
+                   ["说明 dae 没有拦截该进程：dae 未运行、配置未生效或安全区块缺失。",
+                    "此时名单中的程序正在直连外网（故障即放行）。请执行 sudo proxyctl check。",
+                    "（若节点有多个出口 IP 也可能出现此情况，可重试一次。）"])
+
+    if not os.access(direct, os.X_OK):
+        report(False, "3. 找不到 %s" % direct, ["请先执行 sudo ./install.sh。"])
+    else:
+        direct_ip, err, notes = _curl_ip([direct])
+        if direct_ip is None:
+            report(False, "3. proxyctl-direct（不在任何规则中）访问失败",
+                   [err, "默认直连不通：请检查本机网络，或 %s 在本地直连下是否可达。" % url])
+        elif proxy_ip is not None and direct_ip == proxy_ip:
+            report(False, "3. proxyctl-direct 得到 %s，竟与代理出口相同" % direct_ip,
+                   ["默认流量也走了代理：可能开启了系统代理/TUN，或 routing 的 fallback 不是 direct。"])
+        else:
+            report(True, "3. proxyctl-direct 得到 %s，与代理出口不同（默认直连正常）" % direct_ip, notes)
+
+    if proxy_ip is not None:
+        times, failures = measure_new_connections()
+        limit = connect_slow_seconds()
+        shown = "、".join("%.1f" % t for t in times) or "无"
+        if not times:
+            warn("4. 新建代理连接：%d 次全部失败" % failures,
+                 ["第 1 步刚成功过，说明节点时通时断。建议在 v2rayN 中更换节点。"])
+        else:
+            median = sorted(times)[len(times) // 2]
+            summary = "连续新开 %d 条连接，耗时（秒）：%s%s" % (
+                len(times) + failures, shown, "，另有 %d 次失败" % failures if failures else "")
+            if median > limit or failures:
+                warn("4. 新建代理连接偏慢：中位 %.1f 秒（正常应在 %g 秒以内）" % (median, limit),
+                     [summary,
+                      "v2rayN 的延迟测试只反映已建好连接上的一次请求，这种情况下仍可能显示几百毫秒；",
+                      "但 Claude 等频繁新开连接的应用会反复超时重试（Request failed · Retrying）。",
+                      "建议：在 v2rayN 中双击当前节点开启“Mux 多路复用”后重启服务，或更换节点。"])
+            else:
+                report(True, "4. 新建代理连接速度正常：中位 %.1f 秒" % median, [summary])
+
+    tuns = tun_interfaces()
+    if tuns:
+        warn("5. 检测到 TUN 网卡：%s" % "、".join(tuns),
+             ["v2rayN 等的 TUN 模式会把整机流量送进代理，与 dae 叠加后绕过按程序分流的名单，",
+              "也会让所有系统流量挤在同一条节点线路上。使用 proxyctl 时建议关闭 TUN 模式。"])
+
+    ok = all(results)
+    if not ok:
+        print("结论：存在失败项，请参考上面的说明。")
+    elif warnings:
+        print("结论：分流工作正常，但有 %d 项警告，请参考上面的说明。" % len(warnings))
+    else:
+        print("结论：全部通过。")
+    return 0 if ok else 1
+
+
+# -- run / guard-desktop -------------------------------------------------------
+
+
+def proxy_ready():
+    state = service_state()
+    if state != "active":
+        return False, "dae 未运行（状态：%s）" % state
+    if not socks_listening():
+        return False, "SOCKS5 %s 未在监听（xray/v2rayN 未运行？）" % socks_str()
+    return True, None
+
+
+def cmd_run(args):
+    cmd = list(args.command)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        raise ProxyctlError("用法：proxyctl run [--wait N] -- <命令...>")
+    deadline = time.monotonic() + max(0, args.wait)
+    while True:
+        ok, reason = proxy_ready()
+        if ok:
+            break
+        if time.monotonic() >= deadline:
+            msg = "代理不可用，已阻止启动 %s：%s。" % (os.path.basename(cmd[0]), reason)
+            print("错误：" + msg, file=sys.stderr)
+            notify("proxyctl：已阻止启动", msg)
+            return 1
+        time.sleep(1)
+    try:
+        os.execvp(cmd[0], cmd)
+    except OSError as e:
+        raise ProxyctlError("无法启动 %s：%s" % (cmd[0], e))
+
+
+GUARD_KEY = "X-Proxyctl-Guarded=true"
+
+
+def user_apps_dir():
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return _env("PROXYCTL_APPS_DIR", os.path.join(base, "applications"))
+
+
+def system_apps_dirs():
+    if os.environ.get("PROXYCTL_DESKTOP_DIRS"):
+        return os.environ["PROXYCTL_DESKTOP_DIRS"].split(":")
+    dirs = [os.path.join(d, "applications")
+            for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":") if d]
+    dirs += [os.path.expanduser("~/.local/share/flatpak/exports/share/applications"),
+             "/var/lib/flatpak/exports/share/applications", "/var/lib/snapd/desktop/applications"]
+    return dirs
+
+
+def guard_exec_prefix():
+    return "%s run --wait 30 --" % self_bin()
+
+
+def guard_text(text):
+    prefix = guard_exec_prefix()
+    out = []
+    changed = 0
+    for line in text.splitlines(True):
+        m = re.match(r"^(Exec\s*=\s*)(.*?)(\r?\n?)$", line)
+        if m and not m.group(2).startswith(prefix):
+            line = "Exec=%s %s%s" % (prefix, m.group(2), m.group(3))
+            changed += 1
+        out.append(line)
+        if line.strip() == "[Desktop Entry]":
+            out.append(GUARD_KEY + ("\r\n" if line.endswith("\r\n") else "\n"))
+    return "".join(out), changed
+
+
+def _atomic_write_text(path, text, mode=0o644):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".proxyctl-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def cmd_guard_desktop(args):
+    name = os.path.basename(args.desktop)
+    if not name.endswith(".desktop"):
+        name += ".desktop"
+    if name != os.path.basename(args.desktop.rstrip("/")) and "/" in args.desktop:
+        pass  # 允许传入完整路径，但只使用文件名
+    if not re.fullmatch(r"[A-Za-z0-9._@+-]+\.desktop", name):
+        raise ProxyctlError("desktop 文件名不合法：%s" % name)
+    target = os.path.join(user_apps_dir(), name)
+    orig = target + ".proxyctl-orig"
+
+    def is_ours(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return any(l.strip() == GUARD_KEY for l in f)
+        except OSError:
+            return False
+
+    if args.undo:
+        if not os.path.exists(target):
+            print("没有找到 %s，无需撤销。" % target)
+            return 0
+        if not is_ours(target):
+            raise ProxyctlError("%s 不是由 proxyctl 生成的，未做改动。" % target)
+        if os.path.exists(orig):
+            os.replace(orig, target)
+            print("已恢复你原来的 %s。" % target)
+        else:
+            os.unlink(target)
+            print("已删除覆盖副本 %s，恢复使用系统自带的启动器。" % target)
+        return 0
+
+    if os.path.exists(target) and not is_ours(target):
+        src = target
+        shutil.copy2(target, orig)
+        print("你已有自定义的 %s，已另存为 %s，撤销时会恢复它。" % (target, orig))
+    elif os.path.exists(target) and os.path.exists(orig):
+        src = orig
+    else:
+        src = None
+        for d in system_apps_dirs():
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                src = p
+                break
+        if src is None:
+            raise ProxyctlError("在这些目录中找不到 %s：%s" % (name, "、".join(system_apps_dirs())))
+    with open(src, encoding="utf-8") as f:
+        text = f.read()
+    if src == target:
+        new, changed = guard_text(text)
+    else:
+        new, changed = guard_text("".join(l for l in text.splitlines(True) if l.strip() != GUARD_KEY))
+    if changed == 0 and not any(re.match(r"^Exec\s*=", l) for l in text.splitlines()):
+        raise ProxyctlError("%s 中没有 Exec= 行，无法加守卫。" % src)
+    if re.search(r"^DBusActivatable\s*=\s*true", text, re.M | re.I):
+        print("警告：该应用声明了 DBusActivatable=true，桌面环境可能通过 D-Bus 直接启动它而绕过 Exec= 守卫。")
+    _atomic_write_text(target, new)
+    print("已生成 %s（来源：%s），启动时会先确认 dae 与 %s 可用（最多等待 30 秒）。" % (target, src, socks_str()))
+    print("撤销：proxyctl guard-desktop %s --undo" % name)
+    return 0
+
+
+# -- backups / restore ---------------------------------------------------------
+
+
+def cmd_backups(args):
+    names = list_backups()
+    if not names:
+        print("暂无备份（%s）。" % backup_dir())
+        return 0
+    print("备份目录：%s（保留最近 %d 份）" % (backup_dir(), BACKUP_KEEP))
+    rows = []
+    for n in reversed(names):
+        st = os.stat(os.path.join(backup_dir(), n))
+        rows.append([n, datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                     "%d 字节" % st.st_size])
+    print(table(["备份名", "时间", "大小"], rows))
+    print("恢复：sudo proxyctl restore <备份名>")
+    return 0
+
+
+def cmd_restore(args):
+    name = os.path.basename(args.backup)
+    if not BACKUP_RE.match(name):
+        raise ProxyctlError("备份名不合法：%s（用 proxyctl backups 查看）" % args.backup)
+    path = os.path.join(backup_dir(), name)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        raise ProxyctlError("无法读取备份 %s：%s" % (path, e.strerror))
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ProxyctlError("备份文件不是 UTF-8 编码。")
+
+    def compute(old):
+        return text, ["将恢复备份：%s" % name]
+    return transact("restore", compute)
+
+
+# -- GUI ---------------------------------------------------------------------
+
+
+def cmd_gui(args):
+    try:
+        import gi
+        try:
+            gi.require_version("Gtk", "4.0")
+            gtk_version = 4
+        except ValueError:
+            gi.require_version("Gtk", "3.0")
+            gtk_version = 3
+        from gi.repository import Gtk, GLib, Gio, Gdk, Pango  # noqa: F401
+        Adw = None
+        if gtk_version == 4 and not os.environ.get("PROXYCTL_GUI_NO_ADW"):
+            try:  # 有 libadwaita 就用：卡片列表、toast、跟随系统深浅色和强调色
+                gi.require_version("Adw", "1")
+                from gi.repository import Adw
+            except (ValueError, ImportError):
+                Adw = None
+    except Exception as e:  # noqa
+        print("错误：无法加载 PyGObject / GTK（%s）。\n"
+              "请安装系统包：sudo apt install python3-gi gir1.2-gtk-4.0\n"
+              "命令行功能不受影响，可继续使用 proxyctl list / add / rules 等命令。" % e, file=sys.stderr)
+        return 1
+    ok = Gtk.init_check()
+    if isinstance(ok, tuple):  # GTK3 返回 (bool, argv)
+        ok = ok[0]
+    if not ok:
+        print("错误：无法连接图形显示（DISPLAY / WAYLAND_DISPLAY 不可用），GUI 无法启动。", file=sys.stderr)
+        return 1
+    gui = ProxyctlGui(Gtk, GLib, Gio, Gdk, Pango, gtk_version, Adw)
+    return gui.run()
+
+
+SERVICE_STATE_ZH = {"active": "运行中", "inactive": "已停止", "failed": "已崩溃", "activating": "正在启动",
+                    "deactivating": "正在停止", "reloading": "正在重新加载", "unknown": "未知"}
+
+
+def gui_row_actions(name, status, view):
+    """GUI 联网进程表中每一行可用的操作，返回 [(按钮文字, 子命令参数, 是否可点, 提示), ...]。
+
+    只给出真正可以执行的操作：已代理的只能“移除代理”，直连保护的只能“取消保护”，
+    安全区块中的固定规则（xray 等）没有任何按钮——避免出现“能点、点了却被拒绝”的按钮。
+    """
+    if not NAME_RE.fullmatch(name):
+        return []
+    view = view or {}
+    if name in [n for n, _ in view.get("safety", [])]:
+        return []
+    reload_tip = "修改名单后 dae 会重新加载，正在走代理的程序会短暂断线并自动重连。"
+    if status == STATUS_PROXY:
+        return [("移除代理", ["remove", name], True, "从代理名单移除，之后直连。" + reload_tip)]
+    if status == STATUS_DIRECT:
+        return [("取消保护", ["unprotect", name], True, "从直连保护移除，之后按默认规则直连。" + reload_tip)]
+    if is_blacklisted(name):
+        add = ("加入代理", ["add", name], False,
+               "“%s”是通用运行时名称，不能加入代理名单（会把所有同名程序一起代理）。请使用该应用自身的代理设置。" % name)
+    else:
+        add = ("加入代理", ["add", name], True, "加入代理名单。" + reload_tip)
+    return [add, ("直连保护", ["protect", name], True, "加入直连保护（must_direct），保证它永远直连。" + reload_tip)]
+
+
+# 颜色记号：有 libadwaita 时换成主题自带的语义色（随深浅色、强调色自动调整），否则用 GNOME 调色板
+GUI_COLORS_ADW = {"$OK": "@success_color", "$WARN": "@warning_color", "$BAD": "@error_color",
+                  "$ACCENT": "@accent_color"}
+GUI_COLORS_PLAIN = {"$OK": "#2ec27e", "$WARN": "#e5a50a", "$BAD": "#e01b24", "$ACCENT": "#3584e4"}
+# Pango 标记里的小圆点（不能用 CSS 命名色）
+GUI_DOT = {"ok": "#2ec27e", "warn": "#e5a50a", "bad": "#e01b24", "unknown": "#9a9996"}
+
+GUI_CSS = """
+.hero { padding: 14px 18px; border-radius: 12px; }
+.hero-ok { background-color: alpha($OK, 0.10); }
+.hero-warn { background-color: alpha($WARN, 0.16); }
+.hero-bad { background-color: alpha($BAD, 0.16); }
+.hero-unknown { background-color: alpha(currentColor, 0.05); }
+.hero-ok .hero-icon { color: $OK; }
+.hero-warn .hero-icon { color: $WARN; }
+.hero-bad .hero-icon { color: $BAD; }
+.hero-unknown .hero-icon { opacity: 0.5; }
+.hero-title { font-weight: bold; font-size: 1.15em; }
+.group-title { font-weight: bold; }
+.group-count { opacity: 0.5; font-weight: bold; }
+.row-title { font-weight: 600; }
+.caption { font-size: 0.9em; opacity: 0.62; }
+.gone { opacity: 0.5; }
+.tag { padding: 1px 8px; border-radius: 999px; font-size: 0.82em; font-weight: bold; }
+.tag-proxy { color: $OK; background-color: alpha($OK, 0.14); }
+.tag-direct { color: $ACCENT; background-color: alpha($ACCENT, 0.14); }
+.tag-child { color: $WARN; background-color: alpha($WARN, 0.16); }
+.tag-default { background-color: alpha(currentColor, 0.08); }
+.warn-text { color: $WARN; }
+.ok-text { color: $OK; }
+.card-list { border-radius: 10px; border: 1px solid alpha(currentColor, 0.12); }
+.card-list > row { border-bottom: 1px solid alpha(currentColor, 0.08); }
+.output, .output text { background-color: transparent; }
+"""
+
+# 特权操作成功后的提示（toast）
+GUI_DONE = {"add": "已加入代理名单", "remove": "已从代理名单移除", "protect": "已加入直连保护",
+            "unprotect": "已取消直连保护", "restore": "已恢复备份"}
+GUI_TAG = {STATUS_PROXY: "tag-proxy", STATUS_DIRECT: "tag-direct", STATUS_CHILD: "tag-child"}
+
+
+class ProxyctlGui(object):
+    CLAMP = 880  # 内容最大宽度：宽窗口下不把一行拉得太长，读起来更舒服
+
+    def __init__(self, Gtk, GLib, Gio, Gdk, Pango, ver, Adw=None):
+        self.Gtk, self.GLib, self.Gio, self.Gdk, self.Pango, self.ver = Gtk, GLib, Gio, Gdk, Pango, ver
+        self.Adw = Adw
+        cls = Adw.Application if Adw else Gtk.Application
+        self.app = cls(application_id="io.github.proxyctl.gui", flags=Gio.ApplicationFlags.NON_UNIQUE)
+        self.app.connect("activate", self.on_activate)
+        self.proc_sig = None
+        self.proc_data = []
+        self.rules_sig = None
+        self.hero_sig = None
+        self.busy = False
+        self.history = {}
+        self.dump = []  # PROXYCTL_GUI_DUMP：测试时导出每行的按钮状态
+        self.view = None
+        self.procs_running = {}
+        self.alert = False
+
+    # -- GTK3/GTK4 兼容辅助 ------------------------------------------------------
+    def put(self, container, child):
+        Gtk = self.Gtk
+        if isinstance(container, Gtk.Box):
+            if self.ver == 4:
+                container.append(child)
+            else:
+                container.pack_start(child, False, True, 0)
+        elif isinstance(container, Gtk.ListBox):
+            if self.ver == 4:
+                container.append(child)
+            else:
+                container.add(child)
+        elif self.ver == 4:
+            container.set_child(child)
+        else:
+            container.add(child)
+        return child
+
+    def clear(self, container):
+        if self.ver == 4:
+            child = container.get_first_child()
+            while child is not None:
+                nxt = child.get_next_sibling()
+                container.remove(child)
+                child = nxt
+        else:
+            for child in container.get_children():
+                container.remove(child)
+
+    def css(self, widget, *classes, remove=()):
+        for c in remove:
+            if self.ver == 4:
+                widget.remove_css_class(c)
+            else:
+                widget.get_style_context().remove_class(c)
+        for c in classes:
+            if self.ver == 4:
+                widget.add_css_class(c)
+            else:
+                widget.get_style_context().add_class(c)
+        return widget
+
+    def show(self, w):
+        if self.ver == 3:
+            w.show_all()
+        w.present()
+
+    def box(self, vertical=False, spacing=6):
+        o = self.Gtk.Orientation.VERTICAL if vertical else self.Gtk.Orientation.HORIZONTAL
+        return self.Gtk.Box(orientation=o, spacing=spacing)
+
+    def margins(self, w, top, end=None, bottom=None, start=None):
+        end = top if end is None else end
+        bottom = top if bottom is None else bottom
+        start = end if start is None else start
+        w.set_margin_top(top)
+        w.set_margin_bottom(bottom)
+        w.set_margin_start(start)
+        w.set_margin_end(end)
+        return w
+
+    def label(self, text="", xalign=0.0, wrap=False, ellipsize=False, classes=(), markup=False):
+        lb = self.Gtk.Label()
+        if markup:
+            lb.set_markup(text)
+        else:
+            lb.set_text(text)
+        lb.set_xalign(xalign)
+        if wrap:
+            lb.set_wrap(True) if self.ver == 4 else lb.set_line_wrap(True)
+        if ellipsize:
+            lb.set_ellipsize(self.Pango.EllipsizeMode.END)
+            lb.set_hexpand(True)
+        self.css(lb, *classes)
+        return lb
+
+    def button(self, text, cb, *data, tooltip=None, icon=None, flat=False):
+        Gtk = self.Gtk
+        if icon:
+            b = Gtk.Button.new_from_icon_name(icon) if self.ver == 4 else \
+                Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+        else:
+            b = Gtk.Button(label=text)
+        b.connect("clicked", lambda _w: cb(*data))
+        if tooltip:
+            b.set_tooltip_text(tooltip)
+        if flat:
+            self.css(b, "flat")
+        b.set_valign(Gtk.Align.CENTER)
+        return b
+
+    def image(self, icon, size):
+        Gtk = self.Gtk
+        img = Gtk.Image.new_from_icon_name(icon) if self.ver == 4 else \
+            Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.DIALOG)
+        img.set_pixel_size(size)
+        return img
+
+    def set_icon(self, img, icon):
+        if self.ver == 4:
+            img.set_from_icon_name(icon)
+        else:
+            img.set_from_icon_name(icon, self.Gtk.IconSize.DIALOG)
+
+    def clamp(self, child):
+        """限制内容最大宽度并居中；没有 libadwaita 时直接铺满。"""
+        if self.Adw:
+            c = self.Adw.Clamp(maximum_size=self.CLAMP, tightening_threshold=self.CLAMP - 160)
+            c.set_child(child)
+            return c
+        return child
+
+    def scrolled(self, child):
+        sw = self.Gtk.ScrolledWindow()
+        sw.set_vexpand(True)
+        sw.set_hexpand(True)
+        # 不出现横向滚动条：过长的内容省略显示，按钮始终留在窗口内
+        sw.set_policy(self.Gtk.PolicyType.NEVER, self.Gtk.PolicyType.AUTOMATIC)
+        self.put(sw, child)
+        return sw
+
+    def group(self, parent, title, count=None, desc=None):
+        """带标题的卡片列表（GNOME 设置里那种圆角分组），返回 ListBox。"""
+        Gtk = self.Gtk
+        head = self.box(spacing=8)
+        head.set_margin_top(14)
+        head.set_margin_start(4)
+        self.put(head, self.label(title, classes=("group-title",)))
+        if count is not None:
+            self.put(head, self.label(str(count), classes=("group-count",)))
+        self.put(parent, head)
+        if desc:
+            d = self.put(parent, self.label(desc, wrap=True, classes=("caption",)))
+            d.set_margin_start(4)
+        lb = Gtk.ListBox()
+        lb.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.css(lb, "boxed-list" if self.Adw else "card-list")
+        lb.set_margin_top(6)
+        self.put(parent, lb)
+        return lb
+
+    def row(self, lb, title, subtitle=None, tag=None, suffix=(), dim=False, sub_markup=False, tip=None):
+        """列表中的一行：标题（可带状态标签）＋副标题，右侧放按钮等。"""
+        Gtk = self.Gtk
+        r = Gtk.ListBoxRow()
+        r.set_activatable(False)
+        hb = self.margins(self.box(spacing=12), 9, 12, 9, 14)
+        hb.set_size_request(-1, 38)
+        text = self.box(vertical=True, spacing=3)
+        text.set_hexpand(True)
+        text.set_valign(Gtk.Align.CENTER)
+        line = self.box(spacing=8)
+        self.put(line, self.label(title, classes=("row-title",)))
+        if tag:
+            t = self.put(line, self.label(tag[0], classes=("tag", tag[1])))
+            t.set_valign(Gtk.Align.CENTER)
+            if tag[2:]:
+                t.set_tooltip_text(tag[2])
+        self.put(text, line)
+        if subtitle:
+            s = self.put(text, self.label(subtitle, ellipsize=True, classes=("caption",), markup=sub_markup))
+            if tip:
+                s.set_tooltip_text(tip)
+        self.put(hb, text)
+        for w in suffix:
+            self.put(hb, w)
+        if dim:
+            self.css(text, "gone")
+        self.put(r, hb)
+        self.put(lb, r)
+        return r
+
+    def load_css(self):
+        Gtk, Gdk = self.Gtk, self.Gdk
+        css = GUI_CSS
+        for k, v in (GUI_COLORS_ADW if self.Adw else GUI_COLORS_PLAIN).items():
+            css = css.replace(k, v)
+        provider = Gtk.CssProvider()
+        try:
+            if hasattr(provider, "load_from_string"):
+                provider.load_from_string(css)
+            elif self.ver == 4:
+                provider.load_from_data(css, -1)
+            else:
+                provider.load_from_data(css.encode("utf-8"))
+            prio = Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            if self.ver == 4:
+                Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider, prio)
+            else:
+                Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider, prio)
+        except Exception:  # noqa  样式加载失败不影响功能
+            pass
+
+    def copy_text(self, text):
+        try:
+            if self.ver == 4:
+                self.win.get_clipboard().set_content(self.Gdk.ContentProvider.new_for_value(text))
+            else:
+                self.Gtk.Clipboard.get(self.Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+        except Exception:  # noqa
+            pass
+
+    def shortcut(self, name, accel, cb):
+        act = self.Gio.SimpleAction.new(name, None)
+        act.connect("activate", lambda *_: cb())
+        self.app.add_action(act)
+        self.app.set_accels_for_action("app." + name, [accel])
+
+    # -- 构建界面 ----------------------------------------------------------------
+    def on_activate(self, app):
+        Gtk, Adw = self.Gtk, self.Adw
+        self.load_css()
+        Gtk.Window.set_default_icon_name("proxyctl")
+        self.win = (Adw.ApplicationWindow if Adw else Gtk.ApplicationWindow)(application=app)
+        self.win.set_title("按应用代理")
+        self.win.set_default_size(920, 700)
+
+        # 标题栏：左侧进度，中间页面切换，右侧自检、刷新
+        if Adw:
+            self.stack = Adw.ViewStack()
+            switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
+            header = Adw.HeaderBar()
+            header.set_title_widget(switcher)
+        else:
+            self.stack = Gtk.Stack()
+            switcher = Gtk.StackSwitcher()
+            switcher.set_stack(self.stack)
+            header = Gtk.HeaderBar()
+            if self.ver == 4:
+                header.set_title_widget(switcher)
+            else:
+                header.set_custom_title(switcher)
+                header.set_show_close_button(True)
+        self.stack.set_vexpand(True)
+        busy = self.box(spacing=8)
+        self.spinner = self.put(busy, Gtk.Spinner())
+        self.status = self.put(busy, self.label(classes=("caption",)))
+        self.status.set_ellipsize(self.Pango.EllipsizeMode.END)
+        self.status.set_max_width_chars(28)
+        header.pack_start(busy)
+        self.btn_test = self.button("运行自检", self.on_test,
+                                    tooltip="端到端自检：经 SOCKS5、经 dae 代理、默认直连各访问一次外网（约 10 秒）")
+        header.pack_end(self.btn_test)
+        header.pack_end(self.button("", self.force_refresh, icon="view-refresh-symbolic",
+                                    tooltip="立即刷新（Ctrl+R）。平时每 3 秒自动刷新。"))
+
+        body = self.box(vertical=True, spacing=0)
+        self.put(body, self.build_hero())
+        self.content = self.stack
+        self.put(body, self.stack)
+        procs, rules = self.build_procs_page(), self.build_rules_page()
+        if Adw:
+            self.stack.add_titled_with_icon(procs, "procs", "联网进程", "network-transmit-receive-symbolic")
+            self.stack.add_titled_with_icon(rules, "rules", "规则", "view-list-bullet-symbolic")
+        else:
+            self.stack.add_titled(procs, "procs", "联网进程")
+            self.stack.add_titled(rules, "rules", "规则")
+
+        if Adw:
+            self.toasts = Adw.ToastOverlay()
+            self.toasts.set_child(body)
+            tv = Adw.ToolbarView()
+            tv.add_top_bar(header)
+            tv.set_content(self.toasts)
+            self.win.set_content(tv)
+        else:
+            self.win.set_titlebar(header)
+            self.put(self.win, body)
+
+        self.shortcut("refresh", "<Control>r", self.force_refresh)
+        self.shortcut("find", "<Control>f", self.focus_search)
+        self.shortcut("quit", "<Control>q", self.win.close)
+
+        self.show(self.win)
+        self.refresh()
+        if os.environ.get("PROXYCTL_GUI_PAGE"):  # 开发用：直接打开指定页面
+            self.stack.set_visible_child_name(os.environ["PROXYCTL_GUI_PAGE"])
+        self.GLib.timeout_add_seconds(3, self.refresh)
+        auto = os.environ.get("PROXYCTL_GUI_AUTOQUIT")
+        if auto:
+            self.GLib.timeout_add(int(float(auto) * 1000), self.quit)
+
+    def build_hero(self):
+        """顶部状态卡：一句话结论＋四项细节；出问题时变色并给出处理建议。"""
+        Gtk = self.Gtk
+        hero = self.css(self.box(spacing=16), "hero")
+        self.hero_icon = self.put(hero, self.css(self.image("emblem-ok-symbolic", 32), "hero-icon"))
+        self.hero_icon.set_valign(Gtk.Align.CENTER)
+        text = self.box(vertical=True, spacing=4)
+        text.set_hexpand(True)
+        self.hero_title = self.put(text, self.label(classes=("hero-title",)))
+        self.hero_facts = self.put(text, self.label(wrap=True, classes=("caption",), markup=True))
+        self.hero_hint = self.put(text, self.label(wrap=True))
+        self.hero_hint.set_selectable(True)
+        self.put(hero, text)
+        self.hero = hero
+        wrap = self.margins(self.box(), 12, 16, 4)
+        c = self.put(wrap, self.clamp(hero))
+        c.set_hexpand(True)
+        return wrap
+
+    def build_procs_page(self):
+        Gtk = self.Gtk
+        page = self.box(vertical=True, spacing=0)
+        self.search = Gtk.SearchEntry()
+        self.search.set_placeholder_text("筛选进程名（Ctrl+F）")
+        self.search.connect("search-changed", lambda _w: self.render_procs())
+        bar = self.margins(self.box(), 8, 16, 4)
+        self.put(bar, self.clamp(self.search)).set_hexpand(True)
+        self.put(page, bar)
+        self.proc_box = self.box(vertical=True, spacing=0)
+        self.put(page, self.scrolled(self.margins(self.clamp(self.proc_box), 0, 16, 20)))
+        return page
+
+    def build_rules_page(self):
+        Gtk = self.Gtk
+        page = self.box(vertical=True, spacing=0)
+        row = self.box(spacing=8)
+        self.entry = Gtk.Entry()
+        self.entry.set_placeholder_text("输入进程名（以 dae 日志中的 pname 为准），回车加入代理")
+        self.entry.set_hexpand(True)
+        self.entry.connect("activate", lambda _w: self.on_manual("add"))
+        self.put(row, self.entry)
+        add = self.put(row, self.button("加入代理", self.on_manual, "add"))
+        self.css(add, "suggested-action")
+        self.put(row, self.button("直连保护", self.on_manual, "protect",
+                                  tooltip="加入直连保护（must_direct），保证它永远直连"))
+        bar = self.margins(self.box(), 8, 16, 4)
+        self.put(bar, self.clamp(row)).set_hexpand(True)
+        self.put(page, bar)
+        self.rules_box = self.box(vertical=True, spacing=0)
+        self.put(page, self.scrolled(self.margins(self.clamp(self.rules_box), 0, 16, 20)))
+        return page
+
+    def focus_search(self):
+        self.stack.set_visible_child_name("procs")
+        self.search.grab_focus()
+
+    # -- 刷新 --------------------------------------------------------------------
+    def refresh(self):
+        try:
+            self.refresh_status()
+            view, note = load_rules_view()
+            self.procs_running = running_processes()
+            self.refresh_procs(view)
+            self.refresh_rules(view, note)
+            if not self.busy and self.status.get_text().startswith("刷新失败"):
+                self.set_status("")
+        except Exception as e:  # noqa  GUI 不能因为一次刷新失败而退出
+            self.set_status("刷新失败：%s" % e)
+        return True
+
+    def force_refresh(self):
+        self.proc_sig = self.rules_sig = self.hero_sig = None
+        self.refresh()
+
+    def set_status(self, text, busy=False):
+        self.status.set_text(text)
+        self.status.set_tooltip_text(text or None)
+        if busy:
+            self.spinner.start()
+        else:
+            self.spinner.stop()
+
+    def toast(self, text, detail=None, title=None, error=False):
+        """轻量提示；有详情时带一个“详情”按钮。没有 libadwaita 时退回对话框。"""
+        if not self.Adw:
+            self.dialog(title or text, detail or text, error=error)
+            return
+        t = self.Adw.Toast.new(text)
+        t.set_timeout(5)
+        if detail:
+            t.set_button_label("详情")
+            t.connect("button-clicked", lambda *_: self.dialog(title or text, detail, error=error))
+        self.toasts.add_toast(t)
+
+    @staticmethod
+    def chain_down():
+        st = load_chain_state()
+        return int(st.get("fails", 0)) >= 2 and time.time() - st.get("time", 0) <= 600
+
+    @staticmethod
+    def chain_state():
+        st = load_chain_state()
+        if not st or time.time() - st.get("time", 0) > 600:
+            return "unknown", "链路：未知（定时器未运行？）"
+        if st.get("ok") and int(st.get("slow", 0)) >= SLOW_STREAK:
+            return "warn", "链路：很慢（%.1f 秒）" % st.get("elapsed", 0)
+        if st.get("ok"):
+            return "ok", "链路：正常（%.1f 秒）" % st.get("elapsed", 0)
+        if int(st.get("fails", 0)) >= 2:
+            return "bad", "链路：不通"
+        return "warn", "链路：探测失败 1 次"
+
+    def refresh_status(self):
+        state = service_state()
+        listening = socks_listening(0.5)
+        cores = [n for n in CORE_NAMES if n in running_processes()]
+        chain_level, chain_text = self.chain_state()
+        esc = self.GLib.markup_escape_text
+        facts = [
+            ("ok" if state == "active" else "bad", "dae %s" % SERVICE_STATE_ZH.get(state, state)),
+            ("ok" if listening else "bad", "SOCKS %s %s" % (socks_str(), "监听中" if listening else "未监听")),
+            ("ok" if cores else "bad", "、".join(cores) if cores else "代理核心未运行"),
+            (chain_level, chain_text.replace("：", " ", 1)),
+        ]
+        markup = "　".join('<span foreground="%s">●</span> %s' % (GUI_DOT[lv], esc(t, -1)) for lv, t in facts)
+
+        if state != "active":
+            level, title, hint = ("bad", "dae 未运行，名单中的程序正在直连",
+                                  "代理名单中的程序此刻直连外网，会暴露真实 IP（故障即放行）。请执行 sudo systemctl start dae")
+        elif not listening:
+            level, title, hint = ("bad", "SOCKS5 未监听，名单中的程序无法联网",
+                                  "dae 已把名单中的程序交给 %s，但那里没有程序在监听（故障即断开）。请检查 v2rayN / xray。"
+                                  % socks_str())
+        elif self.chain_down():
+            level, title, hint = ("bad", "代理链路不通",
+                                  "xray 连不上节点，名单中的程序无法联网（故障即断开）。请在 v2rayN 中测试或更换节点。")
+        elif chain_level == "warn" and "很慢" in chain_text:
+            level, title, hint = ("warn", "代理链路很慢",
+                                  "Signal 等需要长连接的应用可能反复显示离线。建议在 v2rayN 中测试延迟并更换节点。")
+        elif chain_level == "warn":
+            level, title, hint = ("warn", "链路探测失败 1 次", "健康检查正在每 15 秒复查，偶发一次通常是节点抖动。")
+        elif not cores:
+            level, title, hint = ("warn", "没有找到代理核心进程",
+                                  "SOCKS 端口在监听，但没有运行 %s 中的任何一个。如果你用的是其他代理核心，可以忽略。"
+                                  % "、".join(CORE_NAMES))
+        elif chain_level == "unknown":
+            level, title, hint = ("unknown", "代理已就绪，链路状态未知",
+                                  "没有读到健康检查的结果，定时器可能没有运行：systemctl --user enable --now proxyctl-check.timer")
+        else:
+            level, title, hint = "ok", "代理工作正常", ""
+        self.alert = level in ("bad", "warn")
+        sig = (level, title, hint, markup)
+        if sig == self.hero_sig:
+            return
+        self.hero_sig = sig
+        self.css(self.hero, "hero-" + level, remove=("hero-ok", "hero-warn", "hero-bad", "hero-unknown"))
+        self.set_icon(self.hero_icon, {"ok": "emblem-ok-symbolic", "warn": "dialog-warning-symbolic",
+                                       "bad": "dialog-error-symbolic"}.get(level, "dialog-question-symbolic"))
+        self.hero_title.set_text(title)
+        self.hero_facts.set_markup(markup)
+        self.hero_hint.set_text(hint)
+        self.hero_hint.set_visible(bool(hint))
+        self.hero.set_tooltip_text("链路状态由健康检查定时器经 SOCKS5 实际访问外网得到：正常时每 2 分钟一次，"
+                                   "异常时每 15 秒复查。GUI 只读取结果，自己不发请求。")
+
+    def refresh_procs(self, view):
+        try:
+            rows = list_rows(view)
+        except ProxyctlError as e:
+            self.set_status(str(e))
+            rows = []
+        rows = merge_recent(self.history, rows, time.monotonic(), gui_recent_seconds())
+        data = []
+        for r in rows:
+            st = r["status"]
+            gone = gone_text(r["gone"]) if "gone" in r else ""
+            if gone:
+                # 已消失的行：按当前规则重新计算状态（例如刚刚被加入代理）
+                now_st = status_of(r["name"], view)
+                st = st if (st == STATUS_CHILD and now_st == STATUS_DEFAULT) else now_st
+            data.append((r["name"], r["pids"], r["conns"], st, ", ".join(r["samples"]), gone))
+        self.view = view
+        if data != self.proc_sig:
+            self.proc_sig = data
+            self.proc_data = data
+            self.render_procs()
+
+    def render_procs(self):
+        Gtk = self.Gtk
+        box = self.proc_box
+        self.clear(box)
+        needle = self.search.get_text().strip().lower()
+        rows = [d for d in self.proc_data if not needle or needle in d[0].lower()]
+        rows.sort(key=lambda d: (-d[2], d[0].lower()))
+        safety = [n for n, _ in (self.view or {}).get("safety", [])]
+        # 按“要不要处理”分组：未代理子进程最需要注意，放最前；已断开的放最后
+        groups = [
+            ("需要注意", "代理名单中的程序启动的子进程，名字不同，所以不会走代理。登录失败或提示地区限制时，把它也加入代理。",
+             [d for d in rows if d[3] == STATUS_CHILD]),
+            ("代理中", None, [d for d in rows if d[3] == STATUS_PROXY and not d[5]]),
+            ("直连", None, [d for d in rows if d[3] not in (STATUS_PROXY, STATUS_CHILD) and not d[5]]),
+            ("最近断开", "%d 分钟内连过外网、现已断开的进程，便于发现登录、更新等一闪而过的连接。"
+             % max(1, int(gui_recent_seconds() // 60)),
+             [d for d in rows if d[3] != STATUS_CHILD and d[5]]),
+        ]
+        self.dump = []
+        if not rows:
+            empty = self.box(vertical=True, spacing=10)
+            self.margins(empty, 60, 0)
+            self.put(empty, self.css(self.image("system-search-symbolic" if needle else
+                                                "network-idle-symbolic", 48), "gone"))
+            self.put(empty, self.label("没有匹配“%s”的进程" % needle if needle else "当前没有连接外网的进程",
+                                       xalign=0.5, classes=("caption",)))
+            self.put(box, empty)
+        for title, desc, items in groups:
+            if not items:
+                continue
+            lb = self.group(box, title, len(items), desc)
+            for name, pids, conns, st, samples, gone in items:
+                st_text = "固定规则" if name in safety and st == STATUS_DIRECT else st
+                tag = (st_text, GUI_TAG.get(st, "tag-default"))
+                if st == STATUS_CHILD:
+                    tag += (CHILD_NOTE,)
+                elif st_text == "固定规则":
+                    tag += ("proxyctl 固定的直连规则，保证代理核心自身直连，不能修改。",)
+                parts = [gone] if gone else []
+                if conns:
+                    parts.append("%d 个连接" % conns)
+                if pids > 1:
+                    parts.append("%d 个进程" % pids)
+                if samples:
+                    parts.append(samples)
+                acts = gui_row_actions(name, st, self.view)
+                btns = []
+                for text, sub, sensitive, tip in acts:
+                    b = self.button(text, self.priv, sub, tooltip=tip, flat=text != "加入代理")
+                    b.set_sensitive(sensitive)
+                    btns.append(b)
+                self.row(lb, name, " · ".join(parts), tag=tag, suffix=btns, dim=bool(gone), tip=samples or None)
+                self.dump.append({"name": name, "status": "固定规则（直连）" if st_text == "固定规则" else st_text,
+                                  "gone": bool(gone), "buttons": [[t, s] for t, _, s, _ in acts]})
+        note = _nonroot_note()
+        if note and rows:
+            n = self.put(box, self.label(note, wrap=True, classes=("caption",)))
+            self.margins(n, 16, 4, 0)
+        if self.ver == 3:
+            box.show_all()
+
+    def refresh_rules(self, view, note):
+        running = self.procs_running
+        sig = (json.dumps(view, sort_keys=True, default=str), note,
+               sorted(n for n in (view or {}).get("proxy", []) + (view or {}).get("direct", [])
+                      if n[:COMM_MAX] in running))
+        if sig == self.rules_sig:
+            return
+        self.rules_sig = sig
+        box = self.rules_box
+        self.clear(box)
+        if view is None:
+            if note:
+                self.put(box, self.margins(self.label(note, wrap=True, classes=("caption",)), 16, 4, 0))
+            return
+        if not view.get("initialized"):
+            lb = self.group(box, "尚未初始化")
+            self.row(lb, "配置尚未初始化", "请在终端执行 sudo proxyctl init")
+        reload_tip = "修改名单后 dae 会重新加载，正在走代理的程序会短暂断线并自动重连。"
+        for title, key, cmd, desc in (
+                ("代理名单", "proxy", "remove", "这些程序的所有连接经 dae 转给 %s。" % socks_str()),
+                ("直连保护", "direct", "unprotect", "这些程序永远直连，即使以后改了默认规则。")):
+            names = view.get(key, [])
+            lb = self.group(box, title, len(names), desc)
+            if not names:
+                self.row(lb, "还没有程序", "在上方输入进程名，或到“联网进程”页一键添加", dim=True)
+            for name in names:
+                is_run = name[:COMM_MAX] in running
+                sub = ('<span foreground="%s">●</span> 运行中' % GUI_DOT["ok"]) if is_run else "未运行"
+                tip = None
+                if key == "proxy" and is_blacklisted(name):
+                    sub += '　<span foreground="%s">⚠ 通用运行时名称，建议移除</span>' % GUI_DOT["warn"]
+                elif long_name_warning(name):
+                    sub += '　<span foreground="%s">⚠ 超过 15 个字符，可能不会命中</span>' % GUI_DOT["warn"]
+                    tip = long_name_warning(name)
+                rm = self.button("移除", self.priv, [cmd, name], tooltip=reload_tip, flat=True)
+                self.row(lb, name, sub, suffix=[rm], sub_markup=True, tip=tip)
+        safety = view.get("safety", [])
+        lb = self.group(box, "固定规则", len(safety), "由 proxyctl 维护：代理核心自身必须直连，自检探针走代理。不能删除。")
+        for n, o in safety:
+            what = self.label("直连" if o == "must_direct" else "代理（自检探针）", classes=("caption",))
+            self.row(lb, n, suffix=[what], dim=True)
+        if note:
+            self.put(box, self.margins(self.label(note, wrap=True, classes=("caption",)),
+                                       16, 4, 0))
+        if self.ver == 3:
+            box.show_all()
+
+    # -- 动作 --------------------------------------------------------------------
+    def on_manual(self, sub):
+        name = self.entry.get_text().strip()
+        try:
+            validate_name(name)
+            if sub == "add" and is_blacklisted(name):
+                raise ProxyctlError(blacklist_reason(name))
+        except ProxyctlError as e:
+            self.dialog("无法添加", str(e), error=True)
+            return
+        self.priv([sub, name])
+
+    def priv(self, subargs):
+        if self.busy:
+            return
+        exe = self_bin()
+        if not os.path.exists(exe):
+            self.dialog("未安装", "找不到 %s，请先执行 sudo ./install.sh。" % exe, error=True)
+            return
+        self.busy = True
+        self.content.set_sensitive(False)
+        self.set_status("等待授权：proxyctl %s" % " ".join(subargs), busy=True)
+        cmd = [pkexec_bin(), exe] + subargs
+
+        def work():
+            rc, out = run_cmd(cmd, timeout=300)
+            if rc in (126, 127) and not out.strip():
+                out = ""
+            self.GLib.idle_add(self.priv_done, subargs, rc, out)
+        threading.Thread(target=work, daemon=True).start()
+
+    def priv_done(self, subargs, rc, out):
+        self.busy = False
+        self.content.set_sensitive(True)
+        self.set_status("")
+        title = "proxyctl %s %s" % (" ".join(subargs), "成功" if rc == 0 else "失败")
+        if rc in (126, 127) and not out.strip():
+            self.toast("已取消授权，没有做任何修改")
+        elif rc == 0:
+            if subargs[0] in ("add", "protect"):
+                self.entry.set_text("")
+            msg = "%s：%s" % (GUI_DONE.get(subargs[0], "已完成"), " ".join(subargs[1:]))
+            if "重新加载" in out:
+                msg += "，相关程序会短暂重连"
+            self.toast(msg, detail=out.strip() or None, title=title)
+        else:
+            self.dialog(title, out.strip() or "(无输出)", error=True)
+        self.force_refresh()
+        return False
+
+    def on_test(self):
+        self.btn_test.set_sensitive(False)
+        self.set_status("正在自检（约 10 秒）", busy=True)
+        me = os.path.realpath(__file__)
+
+        def work():
+            rc, out = run_cmd([sys.executable, me, "test"], timeout=120, env=dict(os.environ, NO_COLOR="1"))
+            self.GLib.idle_add(self.test_done, rc, out)
+        threading.Thread(target=work, daemon=True).start()
+
+    def test_done(self, rc, out):
+        self.btn_test.set_sensitive(True)
+        self.set_status("")
+        warn = rc == 0 and "WARN" in out
+        self.dialog("自检全部通过" if rc == 0 and not warn else ("自检通过，但有警告" if rc == 0 else "自检未通过"),
+                    out.strip(), error=rc != 0, warn=warn)
+        return False
+
+    def dialog(self, title, text, error=False, warn=False):
+        """显示命令输出：顶部一行结论，下面是可复制的原始输出。"""
+        Gtk = self.Gtk
+        d = Gtk.Window()
+        d.set_title(title)
+        d.set_transient_for(self.win)
+        d.set_modal(True)
+        d.set_default_size(680, 440)
+        box = self.margins(self.box(vertical=True, spacing=12), 18)
+        head = self.box(spacing=10)
+        level = "bad" if error else ("warn" if warn else "ok")
+        icon = {"bad": "dialog-error-symbolic", "warn": "dialog-warning-symbolic"}.get(level, "emblem-ok-symbolic")
+        wrap = self.css(self.box(), "hero-" + level)  # 只借用图标颜色
+        self.put(wrap, self.css(self.image(icon, 24), "hero-icon"))
+        self.put(head, wrap)
+        self.put(head, self.label(title, classes=("hero-title",)))
+        self.put(box, head)
+        view = Gtk.TextView()
+        view.set_editable(False)
+        view.set_cursor_visible(False)
+        view.set_monospace(True)
+        view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.margins(view, 10)
+        self.css(view, "output")
+        view.get_buffer().set_text(text)
+        sw = self.put(box, self.scrolled(view))
+        self.css(sw, "card" if self.Adw else "card-list")
+        btns = self.box(spacing=8)
+        btns.set_halign(Gtk.Align.END)
+        copy = self.put(btns, self.button("复制输出", self.copy_text, text))
+        copy.connect("clicked", lambda _w: copy.set_label("已复制"))
+        ok = self.put(btns, self.button("关闭", d.destroy))
+        self.css(ok, "suggested-action")
+        self.put(box, btns)
+        self.put(d, box)
+        self.show(d)
+        ok.grab_focus()
+
+    def snapshot(self, path):
+        """开发用：把窗口渲染成 PNG（仅 GTK4），用于检查排版。"""
+        if self.ver != 4:
+            return
+        try:
+            w, h = self.win.get_width(), self.win.get_height()
+            paintable = self.Gtk.WidgetPaintable.new(self.win)
+            snap = self.Gtk.Snapshot()
+            paintable.snapshot(snap, w, h)
+            node = snap.to_node()
+            texture = self.win.get_native().get_renderer().render_texture(node, None)
+            texture.save_to_png(path)
+        except Exception as e:  # noqa
+            print("截图失败：%r" % (e,), file=sys.stderr)
+
+    def quit(self):
+        if os.environ.get("PROXYCTL_GUI_SNAPSHOT"):
+            self.snapshot(os.environ["PROXYCTL_GUI_SNAPSHOT"])
+        if os.environ.get("PROXYCTL_GUI_DUMP"):
+            print(json.dumps({"rows": self.dump, "banner": self.alert}, ensure_ascii=False))
+            sys.stdout.flush()
+        self.app.quit()
+        return False
+
+    def run(self):
+        return self.app.run([sys.argv[0]])
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="proxyctl",
+        description="基于 dae 的按应用代理管理工具（Proxifier 式）。dae 负责分流，proxyctl 只管理规则。")
+    p.add_argument("--version", action="version", version="proxyctl " + VERSION)
+    sub = p.add_subparsers(dest="cmd", metavar="<命令>")
+    sub.required = True
+
+    sub.add_parser("init", help="初始化管理区块并迁移已有规则（幂等，需要 root）")
+    for name, h in (("add", "加入代理名单"), ("remove", "从代理名单移除"),
+                    ("protect", "加入直连保护（must_direct）"), ("unprotect", "从直连保护移除")):
+        sp = sub.add_parser(name, help=h + "（需要 root）")
+        sp.add_argument("name", help="进程名（以 dae 日志中的 pname 为准）")
+    sub.add_parser("rules", help="显示规则")
+    sub.add_parser("list", help="列出当前正在联网的进程")
+    sub.add_parser("pick", help="交互式选择联网进程并加入代理名单")
+    sp = sub.add_parser("check", help="只读健康检查")
+    sp.add_argument("--quiet", action="store_true", help="只输出 WARN / FAIL")
+    sp.add_argument("--notify", action="store_true", help="有 FAIL 时弹出桌面通知")
+    sp.add_argument("--basic", action="store_true",
+                    help="只检查 dae 状态、SOCKS 端口、代理核心和代理链路（定时器使用；链路正常时每 2 分钟探测一次）")
+    sub.add_parser("test", help="端到端自检")
+    sp = sub.add_parser("run", help="确认代理可用后再启动程序")
+    sp.add_argument("--wait", type=int, default=0, metavar="N", help="最多等待 N 秒")
+    sp.add_argument("command", nargs=argparse.REMAINDER, help="-- 之后的命令")
+    sp = sub.add_parser("guard-desktop", help="为 .desktop 启动器生成带启动守卫的覆盖副本")
+    sp.add_argument("desktop", help="desktop 文件名，例如 signal-desktop.desktop")
+    sp.add_argument("--undo", action="store_true", help="撤销")
+    sub.add_parser("backups", help="列出配置备份")
+    sp = sub.add_parser("restore", help="恢复备份（需要 root）")
+    sp.add_argument("backup", help="备份名")
+    sub.add_parser("gui", help="启动图形界面")
+    return p
+
+
+HANDLERS = {
+    "init": cmd_init, "add": cmd_add, "remove": cmd_remove, "protect": cmd_protect,
+    "unprotect": cmd_unprotect, "rules": cmd_rules, "list": cmd_list, "pick": cmd_pick,
+    "check": cmd_check, "test": cmd_test, "run": cmd_run, "guard-desktop": cmd_guard_desktop,
+    "backups": cmd_backups, "restore": cmd_restore, "gui": cmd_gui,
+}
+WRITE_CMDS = {"init", "add", "remove", "protect", "unprotect", "restore"}
+
+
+def _backups_need_root():
+    d = backup_dir()
+    return os.path.exists(d) and not os.access(d, os.R_OK | os.X_OK)
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(argv)
+    try:
+        if args.cmd in WRITE_CMDS:
+            if args.cmd in ("add", "protect", "remove", "unprotect"):
+                validate_name(args.name)  # 提权前先拒绝明显非法的输入
+            if args.cmd == "add" and is_blacklisted(args.name):
+                raise ProxyctlError("拒绝加入代理名单。" + blacklist_reason(args.name))
+            ensure_root(argv, lambda: not can_write_config())
+        elif args.cmd == "backups":
+            ensure_root(argv, _backups_need_root)
+        return HANDLERS[args.cmd](args) or 0
+    except ProxyctlError as e:
+        print("错误：%s" % e, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\n已中断。", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
