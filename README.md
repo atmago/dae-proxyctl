@@ -433,6 +433,9 @@ sudo systemctl enable dae
 | 查看当前名单 | `proxyctl rules` |
 | 代理好像不通了 | `proxyctl test`，然后 `sudo proxyctl check` |
 | 改坏了想恢复 | `sudo proxyctl backups`，然后 `sudo proxyctl restore <备份名>` |
+| 想知道代理程序的 DNS 怎么走 | `proxyctl dns`（GUI：DNS 页） |
+| 不想让运营商看到代理程序查询的域名 | `sudo proxyctl dns --protect on`（GUI：DNS 页 → DNS 防泄漏 → 开启） |
+| 把规则搬到另一台电脑 | 旧电脑 `proxyctl export 规则.json`，新电脑 `sudo proxyctl import 规则.json`（GUI：右上角菜单 → 导入规则 / 导出规则） |
 
 **每次修改名单，dae 都会重新加载，正在走代理的连接会断开一下**，程序一般会自动重连；Signal 重连较慢，可能要 1～2 分钟。
 
@@ -495,7 +498,21 @@ v2rayN 的延迟测试反映的是已建好连接上的一次请求，“新建�
 单独测试 IPv6 流量是否也走了代理。
 
 **DNS 会泄露吗？**
-proxyctl 不做任何 DNS 相关修改（不改 dial_mode，不加 dns 段），`check` 只显示现状。请根据 dae 文档自行决定。
+默认会：应用把域名交给 systemd-resolved，由它以明文发给路由器，运营商能看到查询了哪些域名（连接本身仍走代理）。
+`proxyctl dns` 和 GUI 的 DNS 页会显示每个程序实际的 DNS 走向。
+
+所有程序的 DNS 都由 systemd-resolved 统一代发，dae 分不出是替哪个程序查的，所以无法只让代理程序的 DNS 走代理，
+只能按域名区分。`sudo proxyctl dns --protect on`（DNS 防泄漏）会：
+
+* 在配置末尾加入带标记的 `dns` 区块：局域网、反向解析和国内域名（`geosite:private`、`geosite:cn`、`.lan`）照旧交给原来的 DNS，
+  其余域名交给 dae 查询 8.8.8.8；
+* 在 routing 的代理名单区块之后加入带标记的 `dip(8.8.8.8) -> proxy`，让这些查询经代理发出，运营商只能看到加密的代理流量。
+
+代价：对全系统生效（直连程序查询国外域名也经代理，首次约慢 0.4 秒）；代理不可用时国外域名暂时解析失败；
+直连访问国外网站时拿到的地址按代理出口的位置分配。需要 `/usr/share/dae/geosite.dat`。
+如果配置里已经有你自己写的 `dns` 区块，proxyctl 拒绝开启，不改动你的 DNS 设置。
+`sudo proxyctl dns --protect off` 删除这两处，配置恢复原样。开启和关闭都走同样的备份 / validate / reload / 回滚流程。
+
 注意不要把 dae 的 `dial_mode: domain` 简单等同于 Proxifier 的“远程 DNS”，两者机制并不相同，对 DNS 有严格要求时请单独测试。
 
 **如何回到安装前的配置？**
@@ -529,7 +546,7 @@ routing {
 ```
 
 管理区块之外的所有内容（global、node、group、dns、其他 routing 规则、注释、空行）
-proxyctl 都逐字节原样保留。请不要手工编辑管理区块内部；如果标记被破坏，proxyctl 会拒绝修改。
+proxyctl 都逐字节原样保留（唯一的例外是你主动开启 DNS 防泄漏时加入的两个带标记区域）。请不要手工编辑管理区块内部；如果标记被破坏，proxyctl 会拒绝修改。
 
 如果你的代理核心进程名不在安全区块里（例如某些客户端把 mihomo 改名为 `verge-mihomo`），
 用 `proxyctl protect <进程名>` 把它加入直连保护。
@@ -587,7 +604,7 @@ socks = 127.0.0.1:7891
 
 ### 全部命令
 
-需要 root 的命令（init、add、remove、protect、unprotect、restore）在终端里以普通用户运行时，
+需要 root 的命令（init、add、remove、protect、unprotect、restore、import）在终端里以普通用户运行时，
 会自动通过 sudo 重新执行自身；在图形界面里则通过 pkexec 弹出授权框。
 
 | 命令 | 说明 |
@@ -598,12 +615,16 @@ socks = 127.0.0.1:7891
 | `proxyctl protect <名称>` | 加入直连保护（`must_direct`）。通用运行时名称可以加入这里，因为直连是安全方向。 |
 | `proxyctl unprotect <名称>` | 从直连保护移除。安全区块中的规则不能移除。 |
 | `proxyctl rules` | 显示三个区块，以及 routing 中不受 proxyctl 管理的规则。 |
-| `proxyctl list` | 列出正在连接外网的进程（排除回环和局域网），按进程名聚合，显示 PID 数、连接数、远端示例和状态（代理 / 直连保护 / 默认直连 / 未代理子进程）。 |
+| `proxyctl list` | 列出正在连接外网的进程（排除回环和局域网），按进程名聚合，显示 PID 数、连接数、远端示例、状态（代理 / 直连保护 / 默认直连 / 未代理子进程）和 DNS 走向（直连或代理、明文或加密；代理程序的 DNS 明文直连时标黄）。GUI 的“联网进程”页在状态旁显示同样的 DNS 标签，悬停可看完整路径。 |
 | `proxyctl pick` | `list` 的交互版：输入编号，确认后执行 add。 |
 | `proxyctl check [--quiet] [--notify] [--basic]` | 只读健康检查，每项输出 OK / WARN / FAIL。退出码：0 全部正常，1 有 WARN，2 有 FAIL。 |
 | `proxyctl test` | 端到端自检（见下文）。 |
 | `proxyctl run [--wait N] -- <命令...>` | 启动守卫：确认 dae active 且 SOCKS 端口在监听后才启动程序，否则弹通知并拒绝启动。 |
 | `proxyctl guard-desktop <x.desktop> [--undo]` | 在 `~/.local/share/applications/` 生成启动器覆盖副本，让它经 `proxyctl run --wait 30 --` 启动。不需要 root，不要加 sudo。 |
+| `proxyctl dns [名称]` | 显示代理名单中程序的 DNS 走向：域名解析请求交给谁、是否被 dae 接管、经直连还是代理发往哪个上游、是否加密、谁能看到访问的域名、本地 DNS 污染会不会影响连接。走向相同的程序合并显示；指定名称时可以查看任意进程。GUI 中是“DNS”页。 |
+| `proxyctl dns --protect on\|off` | DNS 防泄漏开关（需要 root，见“DNS 会泄露吗？”）。 |
+| `proxyctl export [文件]` | 把代理名单和直连保护名单导出为 JSON（省略文件名时输出到终端）。只含进程名，不含节点、订阅等信息，可以放心拷到另一台机器或分享给别人。不需要 root。 |
+| `proxyctl import <文件> [--replace]` | 导入 `export` 生成的文件。默认**合并**：只新增，不删除现有条目；加 `--replace` 则让规则与文件完全一致。文件中任何一个名字不合法就整体拒绝；通用运行时名称（如 curl、python3）、安全区块中的名字、与现有规则冲突的名字（合并时）会被跳过并说明原因。同样经过备份 / validate / reload / 回滚流程。 |
 | `proxyctl backups` | 列出配置备份。 |
 | `proxyctl restore <备份名>` | 恢复备份（同样经过 validate / reload / 回滚流程）。 |
 | `proxyctl gui` | 启动图形界面。所有修改通过 pkexec 授权执行，成功后底部弹出提示，失败才弹窗。安装了 libadwaita（gir1.2-adw-1）时界面跟随系统深浅色和强调色。 |
@@ -659,7 +680,7 @@ GUI 的“联网进程”表还会把最近 5 分钟内出现过外网连接、�
 * dae 服务的 Restart 策略（不是 on-failure 时提示）；
 * 默认路由接口（以及配置项 `iface` 中的接口）是否有全局 IPv6 地址（有则提醒单独测试 IPv6）；
 * proxyctl 的 SOCKS 地址是否与 dae 配置中的 socks5 节点一致；
-* 当前 dial_mode、是否存在 systemd-resolve 的 must_direct 规则（仅展示，proxyctl 不做任何 DNS 决策）。
+* 当前 dial_mode、DNS 防泄漏是否开启、是否存在 systemd-resolve 的 must_direct 规则（仅展示）。
 
 非 root 运行时读不到配置，这些项会显示为 SKIP，并提示用 `sudo proxyctl check` 获得完整检查。
 `--quiet` 只输出 WARN/FAIL；`--notify` 在有 FAIL 时调用 notify-send；`--basic` 只检查 dae、端口、代理核心和代理链路。

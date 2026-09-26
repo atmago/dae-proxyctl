@@ -148,6 +148,19 @@ def pkexec_bin():
     return _env("PROXYCTL_PKEXEC", "pkexec")
 
 
+def resolv_conf_path():
+    return _env("PROXYCTL_RESOLV_CONF", "/etc/resolv.conf")
+
+
+def resolved_conf_path():
+    """systemd-resolved 实际使用的上游列表（非 stub 版 resolv.conf）。"""
+    return _env("PROXYCTL_RESOLVED_CONF", "/run/systemd/resolve/resolv.conf")
+
+
+def resolvectl_bin():
+    return _env("PROXYCTL_RESOLVECTL", "resolvectl")
+
+
 def self_bin():
     """安装后的 proxyctl 绝对路径（desktop 文件与 pkexec 使用）。"""
     return _env("PROXYCTL_SELF", "/usr/local/bin/proxyctl")
@@ -210,6 +223,25 @@ BEGIN_MARK = {
     "proxy": "# >>> proxyctl:proxy >>>",
 }
 END_MARK = {b: "# <<< proxyctl:%s <" % b for b in BLOCKS}
+# 可选的“DNS 防泄漏”区域：routing 中的一条 dip 规则 + 文件末尾的 dns 区块，二者同时存在或同时不存在
+DNS_REGIONS = ("dns-route", "dns")
+BEGIN_MARK.update({r: "# >>> proxyctl:%s >>>" % r for r in DNS_REGIONS})
+END_MARK.update({r: "# <<< proxyctl:%s <" % r for r in DNS_REGIONS})
+PROTECT_DNS_IP = "8.8.8.8"
+PROTECT_DNS_UPSTREAM = "googledns"
+PROTECT_DNS_BLOCK = """dns {
+    upstream {
+        %s: 'tcp+udp://%s:53'
+    }
+    routing {
+        request {
+            # 局域网、反向解析和国内域名照旧交给原来的 DNS（路由器），其余域名经代理查询
+            qname(geosite:private, geosite:cn, suffix: lan) -> asis
+            fallback: %s
+        }
+    }
+}""" % (PROTECT_DNS_UPSTREAM, PROTECT_DNS_IP, PROTECT_DNS_UPSTREAM)
+PROTECT_ROUTE_RULE = "dip(%s) -> proxy" % PROTECT_DNS_IP
 MARKERISH_RE = re.compile(r"^#\s*(>>>|<<<)\s*proxyctl:")
 
 RULE_RE = re.compile(r"^\s*pname\(\s*([^()\s,]+)\s*\)\s*->\s*([A-Za-z_][A-Za-z0-9_-]*)\s*$")
@@ -316,6 +348,7 @@ class Parsed(object):
         self.rs = None  # routing { 所在行
         self.re = None  # routing 结束 } 所在行
         self.blocks = None  # {block: (begin, end)} 或 None（未初始化）
+        self.regions = {}  # DNS 防泄漏区域 {"dns-route"/"dns": (begin, end)}
         self.entries = {b: [] for b in BLOCKS}
         self.indent = "    "
         self._parse()
@@ -362,10 +395,8 @@ class Parsed(object):
             s = line.strip()
             if not MARKERISH_RE.match(s):
                 continue
-            if not (self.rs < i < self.re):
-                raise ProxyctlError("第 %d 行的 proxyctl 标记位于 routing 块之外，标记已损坏。" % (i + 1))
             key = None
-            for b in BLOCKS:
+            for b in BLOCKS + DNS_REGIONS:
                 if s == BEGIN_MARK[b]:
                     key = (b, "begin")
                 elif s == END_MARK[b]:
@@ -375,7 +406,15 @@ class Parsed(object):
             if key in found:
                 raise ProxyctlError("proxyctl 标记重复出现（第 %d 行和第 %d 行），标记已损坏。"
                                     % (found[key] + 1, i + 1))
+            inside = self.rs < i < self.re
+            if inside != (key[0] != "dns"):
+                raise ProxyctlError("第 %d 行的 proxyctl 标记位于%s，标记已损坏。"
+                                    % (i + 1, "routing 块之内" if inside else "routing 块之外"))
             found[key] = i
+        self._parse_regions(found)
+        found = {k: v for k, v in found.items() if k[0] in BLOCKS}
+        if not found and self.regions:
+            raise ProxyctlError("配置中有 proxyctl 的 DNS 区域，却没有 proxyctl 管理区块，标记已损坏。")
         if not found:
             self.blocks = None
             body = [l for l in self.lines[self.rs + 1:self.re] if l.strip()]
@@ -394,6 +433,8 @@ class Parsed(object):
         if order != sorted(order):
             raise ProxyctlError("proxyctl 管理区块的顺序不正确（必须是 safety → direct → proxy），标记已损坏。")
         self.blocks = {b: (found[(b, "begin")], found[(b, "end")]) for b in BLOCKS}
+        if self.regions and self.regions["dns-route"][0] < self.blocks["proxy"][1]:
+            raise ProxyctlError("proxyctl 的 dns-route 区域必须位于代理名单区块之后，标记已损坏。")
         self.indent = re.match(r"^[ \t]*", self.lines[found[("safety", "begin")]]).group(0)
         for b in BLOCKS:
             begin, end = self.blocks[b]
@@ -413,7 +454,26 @@ class Parsed(object):
                     raise ProxyctlError("安全区块第 %d 行出口无法识别：%s" % (i + 1, line.strip()))
                 self.entries[b].append((name, outbound))
 
+    def _parse_regions(self, found):
+        keys = [(r, k) for r in DNS_REGIONS for k in ("begin", "end")]
+        have = [k for k in keys if k in found]
+        if not have:
+            return
+        if len(have) != len(keys):
+            raise ProxyctlError("proxyctl 的 DNS 防泄漏区域不完整，标记已损坏。请手工修复，或用 proxyctl restore 恢复备份。")
+        for r in DNS_REGIONS:
+            b, e = found[(r, "begin")], found[(r, "end")]
+            if e < b:
+                raise ProxyctlError("proxyctl 的 %s 区域标记顺序颠倒，标记已损坏。" % r)
+            self.regions[r] = (b, e)
+        if self.regions["dns"][0] < self.re:
+            raise ProxyctlError("proxyctl 的 dns 区域必须位于 routing 块之后，标记已损坏。")
+
     # -- 查询 --------------------------------------------------------------
+    @property
+    def dns_protected(self):
+        return bool(self.regions)
+
     @property
     def initialized(self):
         return self.blocks is not None
@@ -431,6 +491,8 @@ class Parsed(object):
             for b in BLOCKS:
                 begin, end = self.blocks[b]
                 idx.update(range(begin, end + 1))
+        for begin, end in self.regions.values():
+            idx.update(range(begin, end + 1))
         return idx
 
     def unmanaged_rules(self):
@@ -726,6 +788,179 @@ def op_unprotect(text, name):
     return render(parsed, lists), msgs
 
 
+def own_dns_sections(parsed):
+    """不属于 proxyctl 的顶层 dns 区块所在行号。"""
+    mine = set()
+    if "dns" in parsed.regions:
+        b, e = parsed.regions["dns"]
+        mine = set(range(b, e + 1))
+    out = []
+    depth = 0
+    for i, line in enumerate(parsed.lines):
+        code = code_part(line)
+        if depth == 0 and re.match(r"^\s*dns\s*\{", code) and i not in mine:
+            out.append(i)
+        depth += code.count("{") - code.count("}")
+    return out
+
+
+def op_dns_protect(text, on):
+    """开启 / 关闭“国外域名的 DNS 经代理查询”。"""
+    parsed = Parsed(text)
+    _require_init(parsed)
+    msgs = []
+    text = render(parsed, current_lists(parsed, msgs))
+    parsed = Parsed(text)
+    lines = list(parsed.lines)
+    nl = parsed.nl
+    if on:
+        if parsed.dns_protected:
+            msgs.append("DNS 防泄漏已经开启，无需重复开启。")
+            return text, msgs
+        own = own_dns_sections(parsed)
+        if own:
+            raise ProxyctlError("配置第 %d 行已有你自己写的 dns 区块。proxyctl 不改动你自己的 DNS 设置，"
+                                "请手工在其中加入经代理查询的上游，或删除它后再开启。" % (own[0] + 1))
+        indent = parsed.indent
+        route = [indent + BEGIN_MARK["dns-route"] + nl, indent + PROTECT_ROUTE_RULE + nl,
+                 indent + END_MARK["dns-route"] + nl]
+        at = parsed.blocks["proxy"][1] + 1
+        lines[at:at] = route
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += nl
+        lines.append(nl)
+        lines.append(BEGIN_MARK["dns"] + nl)
+        lines.extend(l + nl for l in PROTECT_DNS_BLOCK.split("\n"))
+        lines.append(END_MARK["dns"] + nl)
+        msgs.append("已开启 DNS 防泄漏：国内和局域网域名照旧查询原来的 DNS，其余域名由 dae 经代理向 %s 查询，"
+                    "运营商看不到这些查询。" % PROTECT_DNS_IP)
+        msgs.append("注意：这对全系统生效；代理不可用时，国外域名会暂时解析失败。")
+    else:
+        if not parsed.dns_protected:
+            msgs.append("DNS 防泄漏本来就没有开启。")
+            return text, msgs
+        for r in ("dns", "dns-route"):  # 先删后面的，前面的行号不变
+            b, e = parsed.regions[r]
+            if r == "dns":
+                if e + 1 < len(lines) and is_blank(lines[e + 1]):
+                    e += 1
+                elif b > 0 and is_blank(lines[b - 1]):
+                    b -= 1
+            del lines[b:e + 1]
+        msgs.append("已关闭 DNS 防泄漏：DNS 恢复为原来的走法。")
+    return "".join(lines), msgs
+
+
+# ---------------------------------------------------------------------------
+# 规则导入 / 导出（只含进程名，不含节点等敏感信息，可以放心分享）
+# ---------------------------------------------------------------------------
+
+EXPORT_FORMAT = "proxyctl-lists"
+EXPORT_VERSION = 1
+IMPORT_MAX_BYTES = 1 << 20
+
+
+def export_data(view):
+    return {
+        "format": EXPORT_FORMAT,
+        "version": EXPORT_VERSION,
+        "exported": datetime.datetime.now().isoformat(timespec="seconds"),
+        "proxy": list(view.get("proxy", [])),
+        "direct": list(view.get("direct", [])),
+    }
+
+
+def export_text(view):
+    return json.dumps(export_data(view), ensure_ascii=False, indent=2) + "\n"
+
+
+def parse_import(raw):
+    """解析导出文件，返回 {"proxy": [...], "direct": [...]}；任何不合法之处都整体拒绝。"""
+    if isinstance(raw, bytes):
+        if len(raw) > IMPORT_MAX_BYTES:
+            raise ProxyctlError("导入文件过大（超过 1 MB），不像是 proxyctl 导出的名单。")
+        try:
+            raw = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raise ProxyctlError("导入文件不是 UTF-8 编码。")
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise ProxyctlError("导入文件不是合法的 JSON：%s" % e)
+    if not isinstance(data, dict) or not ("proxy" in data or "direct" in data):
+        raise ProxyctlError("导入文件中没有 proxy / direct 名单，不是 proxyctl 导出的文件。")
+    if data.get("format", EXPORT_FORMAT) != EXPORT_FORMAT:
+        raise ProxyctlError("导入文件格式为“%s”，不是 %s。" % (data.get("format"), EXPORT_FORMAT))
+    ver = data.get("version", EXPORT_VERSION)
+    if not isinstance(ver, int) or ver > EXPORT_VERSION:
+        raise ProxyctlError("导入文件版本为 %r，当前 proxyctl 只支持到 %d，请先升级 proxyctl。" % (ver, EXPORT_VERSION))
+    out = {}
+    for key in ("proxy", "direct"):
+        names = data.get(key, [])
+        if not isinstance(names, list):
+            raise ProxyctlError("导入文件中的 %s 必须是进程名列表。" % key)
+        for n in names:
+            validate_name(n)
+        out[key] = _dedupe(names)
+    both = [n for n in out["proxy"] if n in out["direct"]]
+    if both:
+        raise ProxyctlError("导入文件自相矛盾：%s 同时出现在 proxy 和 direct 中，未做任何修改。" % "、".join(both))
+    return out
+
+
+def import_plan(cur_proxy, cur_direct, data, replace=False):
+    """计算导入后的名单。返回 (新 proxy, 新 direct, 消息)。只依赖名单，GUI 也用它做预览。"""
+    msgs = []
+    proxy = [] if replace else list(cur_proxy)
+    direct = [] if replace else list(cur_direct)
+    for n in data["direct"]:
+        if n in SAFETY_NAMES:
+            if SAFETY_NAMES[n] != "must_direct":
+                msgs.append("跳过：“%s”在安全区块中走代理（用于自检），不能改为直连。" % n)
+            continue  # 已在安全区块中直连保护
+        if n in proxy:
+            msgs.append("跳过：“%s”当前在代理名单中，不改为直连保护（如确需，请先 proxyctl remove %s）。" % (n, n))
+            continue
+        if n not in direct:
+            direct.append(n)
+    for n in data["proxy"]:
+        if n in SAFETY_NAMES:
+            if SAFETY_NAMES[n] != "proxy":
+                msgs.append("跳过：“%s”是代理核心，在安全区块中必须直连，走代理会形成回环。" % n)
+            continue
+        if is_blacklisted(n):
+            msgs.append("跳过：“%s”是通用运行时名称，不能加入代理名单。" % n)
+            continue
+        if n in direct:
+            msgs.append("跳过：“%s”当前在直连保护名单中，不改为代理（如确需，请先 proxyctl unprotect %s）。" % (n, n))
+            continue
+        if n not in proxy:
+            proxy.append(n)
+    for key, old, new in (("代理名单", cur_proxy, proxy), ("直连保护", cur_direct, direct)):
+        added = [n for n in new if n not in old]
+        gone = [n for n in old if n not in new]
+        if added:
+            msgs.append("%s新增 %d 个：%s" % (key, len(added), "、".join(added)))
+        if gone:
+            msgs.append("%s移除 %d 个：%s" % (key, len(gone), "、".join(gone)))
+        for n in added:
+            if long_name_warning(n):
+                msgs.append(long_name_warning(n))
+    return proxy, direct, msgs
+
+
+def op_import(text, data, replace=False):
+    parsed = Parsed(text)
+    _require_init(parsed)
+    msgs = []
+    lists = current_lists(parsed, msgs)
+    proxy, direct, plan_msgs = import_plan(parsed.names("proxy"), parsed.names("direct"), data, replace)
+    msgs.extend(plan_msgs)
+    lists["proxy"] = [(n, "proxy") for n in proxy]
+    lists["direct"] = [(n, "must_direct") for n in direct]
+    return render(parsed, lists), msgs
+
+
 # ---------------------------------------------------------------------------
 # 外部命令
 # ---------------------------------------------------------------------------
@@ -992,11 +1227,15 @@ def aggregate(conns, max_samples=3):
     return sorted(agg.values(), key=lambda a: (-a["conns"], a["name"]))
 
 
-def collect_connections():
+def ss_connections():
     rc, out = run_cmd([ss_bin(), "-tunpH"], timeout=15)
     if rc != 0:
         raise ProxyctlError("执行 ss 失败：%s" % out.strip())
-    return aggregate(parse_ss(out))
+    return parse_ss(out)
+
+
+def collect_connections(conns=None):
+    return aggregate(ss_connections() if conns is None else conns)
 
 
 # ---------------------------------------------------------------------------
@@ -1023,6 +1262,7 @@ def rules_view_from_parsed(parsed):
         "proxy": parsed.names("proxy"),
         "unmanaged_pname": [list(e) for e in parsed.unmanaged_pname_rules()],
         "unmanaged": [c for _, c in parsed.unmanaged_rules()],
+        "dns": dns_config_from_parsed(parsed),
     }
 
 
@@ -1076,6 +1316,378 @@ def status_of(name, view):
         if n == name:
             return "其他规则(%s)" % o
     return STATUS_DEFAULT
+
+
+# ---------------------------------------------------------------------------
+# DNS 走向：应用的域名解析请求经过哪里、谁能看到、会不会被污染
+# ---------------------------------------------------------------------------
+
+SECTION_OPEN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\{\s*$")
+KV_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.+?)\s*$")
+UPSTREAM_RE = re.compile(r"^([a-z0-9+]+)://(?:[^@/]*@)?(\[[^\]]+\]|[^:/?#]+)(?::(\d+))?")
+DIAL_MODES = ("ip", "domain", "domain+", "domain++")
+DIP_RULE_RE = re.compile(r"^dip\(\s*([^()]+?)\s*\)\s*->\s*([A-Za-z_][A-Za-z0-9_()-]*)$")
+ENCRYPTED_SCHEMES = {"https": "DoH", "tls": "DoT", "quic": "DoQ", "h3": "DoH3", "http3": "DoH3"}
+RESOLVED_STUBS = ("127.0.0.53", "127.0.0.54")
+RESOLVED_COMM = "systemd-resolve"  # systemd-resolved 的进程名被内核截断为 15 个字符
+
+
+def config_sections(parsed):
+    """把配置按嵌套区块分组：{("dns", "routing", "request"): [代码行, ...]}。只用于展示，不用于写回。"""
+    out = {}
+    stack = []
+    for line in parsed.lines:
+        code = code_part(line, keep_strings=True).strip()
+        if not code:
+            continue
+        m = SECTION_OPEN_RE.match(code)
+        if m:
+            stack.append(m.group(1))
+            out.setdefault(tuple(stack), [])
+            continue
+        if code == "}":
+            if stack:
+                stack.pop()
+            continue
+        if stack:
+            out.setdefault(tuple(stack), []).append(code)
+    return out
+
+
+def _kv(lines):
+    kv = {}
+    for code in lines:
+        m = KV_RE.match(code)
+        if m and m.group(1) not in kv:
+            kv[m.group(1)] = m.group(2).strip("'\"")
+    return kv
+
+
+def parse_upstream(url):
+    """dae 的 upstream 地址 → {scheme, host, port}。故意丢掉路径和用户信息（例如 NextDNS 的私有 ID），
+    因为结果会写进所有人可读的规则缓存。"""
+    m = UPSTREAM_RE.match(url.strip())
+    if not m:
+        return {"scheme": "?", "host": "?", "port": None}
+    scheme = m.group(1)
+    default = {"https": 443, "tls": 853, "quic": 853, "h3": 443, "http3": 443}.get(scheme, 53)
+    return {"scheme": scheme, "host": m.group(2).strip("[]"), "port": int(m.group(3) or default)}
+
+
+def dns_config_from_parsed(parsed):
+    secs = config_sections(parsed)
+    dial = (_kv(secs.get(("global",), [])).get("dial_mode") or "domain").lower()
+    upstreams = {}
+    for code in secs.get(("dns", "upstream"), []):
+        m = KV_RE.match(code)
+        if m:
+            upstreams[m.group(1)] = parse_upstream(m.group(2).strip("'\""))
+    request = secs.get(("dns", "routing", "request"), [])
+    return {
+        "dial_mode": dial,
+        "has_dns": ("dns",) in secs,
+        "upstreams": upstreams,
+        "request_fallback": _kv(request).get("fallback"),
+        "request_rules": len([c for c in request if not c.startswith("fallback")]),
+        "routing_fallback": _kv(secs.get(("routing",), [])).get("fallback"),
+        "protect": parsed.dns_protected,
+        # 单独的 dip(...) -> 出口 规则：推演 DNS 上游查询的出口时会用到
+        "dip_rules": [[m.group(1), m.group(2)] for m in
+                      (DIP_RULE_RE.match(c) for c in secs.get(("routing",), [])) if m],
+        # 可能影响 DNS 包走向、但 proxyctl 不去推演的规则（dport / l4proto / 组合规则等）
+        "other_rules": [c for c in secs.get(("routing",), [])
+                        if not c.startswith("fallback") and not RULE_RE.match(c) and not DIP_RULE_RE.match(c)],
+    }
+
+
+def _nameservers(path):
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    out.append(parts[1].split("%")[0])
+    except OSError:
+        return None
+    return out
+
+
+def resolver_info():
+    """本机应用把 DNS 请求交给谁。"""
+    ns = _nameservers(resolv_conf_path())
+    info = {"nameservers": ns or [], "kind": "unknown", "upstreams": [], "dot": None}
+    if ns is None:
+        return info
+    if any(n in RESOLVED_STUBS for n in ns):
+        info["kind"] = "resolved"
+        info["upstreams"] = [n for n in (_nameservers(resolved_conf_path()) or []) if n not in RESOLVED_STUBS]
+        rc, out = run_cmd([resolvectl_bin(), "status"], timeout=5)
+        if rc == 0:
+            # 只看 Global 和默认路由网卡的协议行
+            info["dot"] = bool(re.search(r"\+DNSOverTLS", out))
+    elif ns and all(_is_loopback(n) for n in ns):
+        info["kind"] = "local"  # dnsmasq 等本机 DNS 程序
+    elif ns:
+        info["kind"] = "direct"  # 应用进程自己把请求发给外部 DNS
+    return info
+
+
+def _is_loopback(addr):
+    try:
+        return ipaddress.ip_address(addr).is_loopback
+    except ValueError:
+        return False
+
+
+def route_of(name, view):
+    """按 routing 首条命中推算某个进程名的出口。返回 (出口, 依据)。"""
+    comm = name[:COMM_MAX]
+    for n, o in (view or {}).get("safety", []):
+        if n[:COMM_MAX] == comm:
+            return o, "安全区块 pname(%s)" % n
+    for n in (view or {}).get("direct", []):
+        if n[:COMM_MAX] == comm:
+            return "must_direct", "直连保护 pname(%s)" % n
+    for n in (view or {}).get("proxy", []):
+        if n[:COMM_MAX] == comm:
+            return "proxy", "代理名单 pname(%s)" % n
+    for n, o in (view or {}).get("unmanaged_pname", []):
+        if n[:COMM_MAX] == comm:
+            return o, "routing 规则 pname(%s)" % n
+    fb = ((view or {}).get("dns") or {}).get("routing_fallback")
+    return (fb or "direct"), ("routing 的 fallback" if fb else "routing 的 fallback（未读到，按 direct 推断）")
+
+
+def dip_route(ip, view):
+    """按 routing 中单独的 dip 规则推算发往 ip 的出口；没有命中返回 None。"""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    for cidrs, outbound in ((view or {}).get("dns") or {}).get("dip_rules", []):
+        for c in cidrs.split(","):
+            c = c.strip()
+            try:
+                if addr in ipaddress.ip_network(c, strict=False):
+                    return outbound, "routing 规则 dip(%s)" % cidrs
+            except ValueError:
+                continue  # geoip:cn 等不推演
+    return None
+
+
+def upstream_route(sender, ips, view):
+    """dae 向上游查询时的出口：进程名规则优先（它们排在最前），否则看 dip 规则，最后是 fallback。"""
+    outbound, why = route_of(sender, view)
+    if why.startswith("routing 的 fallback"):
+        for ip in ips:
+            hit = dip_route(ip, view)
+            if hit:
+                return hit
+    return outbound, why
+
+
+def outbound_text(o):
+    if o == "must_direct":
+        return "直连（must_direct）"
+    if o in ("direct", "block"):
+        return {"direct": "直连", "block": "丢弃（block）"}[o]
+    return "代理（%s）" % o
+
+
+def app_dns_sockets(name, conns):
+    """这个程序自己正在进行的 DNS 连接（远端端口 53 / 853，不含发往本机 stub 的）。"""
+    ports = set()
+    for c in conns or []:
+        if c["peer_port"] in ("53", "853") and not c["peer_ip"].is_loopback \
+                and any(n[:COMM_MAX] == name[:COMM_MAX] for n, _ in c["procs"]):
+            ports.add(c["peer_port"])
+    return ports
+
+
+def dns_route(app, view, resolver, conns=None):
+    """推演一个程序的 DNS 走向。
+
+    返回 {"steps": [(标题, 说明, 级别)], "facts": {...}}，级别为 ok / warn / info。
+    依据 dae 的行为：发往 53 端口的请求被 dae 的 DNS 模块接管，除非命中 must_direct；
+    dae 向上游查询时按“发出请求的进程名 + 上游地址”再匹配一次 routing。
+    """
+    dns = (view or {}).get("dns") or {}
+    dial = dns.get("dial_mode") or "domain"
+    steps = []
+    own = app_dns_sockets(app, conns)
+    kind = resolver.get("kind")
+    if own:
+        sender = app
+        who = "“%s”自己直接向外发 DNS 请求（观察到发往 %s 端口的连接）。" % (
+            app, " / ".join(sorted(own)))
+        servers = []
+        dot = "853" in own and "53" not in own
+    elif kind == "resolved":
+        sender = RESOLVED_COMM
+        servers = resolver.get("upstreams") or []
+        who = "“%s”把域名交给本机 systemd-resolved（127.0.0.53）代查。向外发请求的是 %s 进程，" \
+              "不是程序本身，所以代理名单管不到 DNS。" % (app, RESOLVED_COMM)
+        dot = bool(resolver.get("dot"))
+    elif kind == "direct":
+        sender = app
+        servers = resolver.get("nameservers") or []
+        who = "“%s”按 /etc/resolv.conf 自己向 %s 发 DNS 请求。" % (app, "、".join(servers))
+        dot = False
+    elif kind == "local":
+        sender = None
+        servers = resolver.get("nameservers") or []
+        who = "“%s”把域名交给本机的 DNS 程序（%s），向外查询的是哪个进程无法确定。" % (app, "、".join(servers))
+        dot = False
+    else:
+        sender = None
+        servers = []
+        who = "读不到 /etc/resolv.conf，无法确定“%s”把 DNS 请求交给了谁。" % app
+        dot = False
+    steps.append(("应用发起解析", who, "info"))
+
+    facts = {"sender": sender, "visible_to": None, "encrypted": None, "poison_safe": dial != "ip"}
+    if sender is None:
+        steps.append(("向外查询", "无法推断（取决于本机 DNS 程序自身的设置）。", "warn"))
+    else:
+        fb = dns.get("request_fallback")
+        ups = dns.get("upstreams") or {}
+        dae_up = ups.get(fb) if (dns.get("has_dns") and fb and fb != "asis" and not dot) else None
+        outbound, why = upstream_route(sender, [dae_up["host"]] if dae_up else servers, view)
+        facts["outbound"] = outbound
+        srv = "、".join(servers) if servers else "原目标服务器"
+        if dot:
+            enc_how = "DoT 加密（853 端口）"
+            steps.append(("向外查询",
+                          "%s 用 %s 发往 %s。dae 只接管 53 端口，这里不经过 dae 的 DNS 模块；"
+                          "按 %s 走%s。" % (sender, enc_how, srv, why, outbound_text(outbound)), "ok"))
+            facts["encrypted"] = True
+            facts["visible_to"] = "DNS 服务器（%s）" % srv
+        elif outbound == "must_direct":
+            steps.append(("向外查询",
+                          "%s 命中 %s，dae 不接管，以明文 UDP 直接发往 %s。" % (sender, why, srv), "warn"))
+            facts["encrypted"] = False
+            facts["visible_to"] = "本地网络、运营商和 DNS 服务器（%s）" % srv
+        else:
+            if dae_up:
+                u = dae_up
+                target = "%s（%s://%s:%s）" % (fb, u["scheme"], u["host"], u["port"])
+                enc = ENCRYPTED_SCHEMES.get(u["scheme"])
+                extra = "（另有 %d 条 dns 请求规则可能把部分域名分给别的上游）" % dns["request_rules"] \
+                    if dns.get("request_rules") else ""
+                sent_to = " dae 配置的上游 %s%s" % (target, extra)
+            else:
+                enc = None
+                sent_to = "原来的 %s（dae 未配置 DNS 上游，按原目标转发）" % srv
+            facts["encrypted"] = bool(enc)
+            level = "ok" if enc or outbound not in ("direct", "must_direct") else "warn"
+            steps.append(("dae 接管",
+                          "发往 53 端口的请求被 dae 的 DNS 模块接管，dae 顺便记下“域名 → IP”用于分流。", "info"))
+            if dns.get("protect") and dae_up and fb == PROTECT_DNS_UPSTREAM:
+                steps.append(("向外查询",
+                              "DNS 防泄漏已开启：国外域名由 dae 经%s发给 %s，查询在代理隧道里，运营商看不到"
+                              "（依据 %s）。国内和局域网域名照旧直连查询 %s。"
+                              % (outbound_text(outbound), PROTECT_DNS_IP, why, srv), level))
+            else:
+                steps.append(("向外查询",
+                              "dae %s发给%s。这个请求来自 %s，命中 %s，走%s。"
+                              % ("以 %s 加密" % enc if enc else "以明文 UDP ", sent_to, sender, why,
+                                 outbound_text(outbound)), level))
+            if enc:
+                facts["visible_to"] = "DNS 上游服务器" + ("（经代理节点转发）" if outbound not in ("direct", "must_direct") else "")
+            elif outbound in ("direct", "must_direct"):
+                facts["visible_to"] = "本地网络、运营商和 DNS 服务器"
+            else:
+                facts["visible_to"] = "代理节点和 DNS 服务器（本地网络看不到）"
+            if dns.get("protect") and dae_up:
+                facts["visible_to"] += "；国内和局域网域名仍由本地网络可见"
+        if dns.get("other_rules"):
+            steps.append(("注意",
+                          "routing 中还有 %d 条非进程名规则（如 dip / dport），它们排在 proxyctl 规则之后，"
+                          "如果匹配到 DNS 包可能改变上面的结论：%s"
+                          % (len(dns["other_rules"]), "；".join(dns["other_rules"][:3])), "info"))
+
+    app_out, app_why = route_of(app, view)
+    app_why = app_why.split(" pname(")[0]  # 同一组程序共用说明，不带各自的名字
+    if app_why[:1].isascii():
+        app_why = " " + app_why + (" " if app_why[-1:].isascii() else "")
+    if app_out in ("direct", "must_direct", "block"):
+        steps.append(("建立连接", "连接按%s走%s，使用上面解析到的 IP。" % (app_why, outbound_text(app_out)), "info"))
+        facts["poison_safe"] = False
+    elif dial == "ip":
+        steps.append(("建立连接",
+                      "连接按%s走代理。dial_mode 为 ip：dae 把本地解析得到的 IP 交给代理节点，"
+                      "本地 DNS 被污染时连接会发往错误的地址。" % app_why, "warn"))
+    else:
+        steps.append(("建立连接",
+                      "连接按%s走代理。dial_mode 为 %s：dae 从握手中嗅探出域名交给代理节点，由节点重新解析，"
+                      "本地 DNS 被污染也不影响。（嗅探不到域名的连接仍使用本地解析的 IP。）" % (app_why, dial), "ok"))
+    return {"steps": steps, "facts": facts}
+
+
+def raw_connections():
+    try:
+        return ss_connections()
+    except ProxyctlError:
+        return []
+
+
+def dns_badge(route, app_outbound):
+    """一行进程旁边的 DNS 简要标签：(文字, 级别, 详细说明)。级别 ok / warn / plain。
+
+    代理程序的 DNS 如果让本地网络看得到（明文直连），标为 warn；直连程序的 DNS 本来就直连，不算问题。
+    """
+    f = route["facts"]
+    detail = "\n".join("%d. %s：%s" % (i, t, d) for i, (t, d, _) in enumerate(route["steps"], 1))
+    detail += "\n\n" + "\n".join(dns_summary(route)[:2])
+    if f.get("sender") is None or f.get("encrypted") is None:
+        return "DNS 未知", "plain", detail
+    via = "直连" if f.get("outbound") in ("direct", "must_direct") else "代理"
+    # 走代理时查询在隧道里，运营商看不到，明文与否不再重要
+    text = "DNS 代理" if via == "代理" else "DNS 直连·%s" % ("加密" if f["encrypted"] else "明文")
+    proxied = app_outbound not in ("direct", "must_direct", "block")
+    if not proxied:
+        level = "plain"
+    elif via == "直连" and not f["encrypted"]:
+        level = "warn"
+    else:
+        level = "ok"
+    return text, level, detail
+
+
+def dns_groups(names, view, resolver, conns):
+    """把 DNS 走向相同的程序归为一组，返回 [(程序名列表, route)]。"""
+    groups = []
+    for n in names:
+        r = dns_route(n, view, resolver, conns)
+        key = json.dumps([[t, d.replace("“%s”" % n, "“{app}”"), lv] for t, d, lv in r["steps"]] + [r["facts"]],
+                         ensure_ascii=False, sort_keys=True)
+        for g in groups:
+            if g[0] == key:
+                g[1].append(n)
+                break
+        else:
+            groups.append((key, [n], r))
+    out = []
+    for _, members, r in groups:
+        if len(members) > 1:
+            first = "“%s”" % members[0]
+            r = {"steps": [(t, d.replace(first, "这些程序"), lv) for t, d, lv in r["steps"]], "facts": r["facts"]}
+        out.append((members, r))
+    return out
+
+
+def dns_summary(route):
+    f = route["facts"]
+    lines = []
+    if f.get("visible_to"):
+        lines.append("谁能看到访问的域名：%s。" % f["visible_to"])
+    if f.get("poison_safe"):
+        lines.append("本地 DNS 污染：不影响走代理的连接（节点重新解析域名）。")
+    else:
+        lines.append("本地 DNS 污染：会影响（连接使用本地解析的 IP）。")
+    lines.append("如果程序自带 DoH（如浏览器的“安全 DNS”），它的 DNS 在自己的 HTTPS 连接里，跟随程序走代理，不经过上面的路径。")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -1408,10 +2020,10 @@ def cmd_rules(args):
     return 0
 
 
-def list_rows(view):
+def list_rows(view, conns=None):
     """联网进程（ss 快照）加上代理名单程序中未代理的子进程。"""
     rows = []
-    for a in collect_connections():
+    for a in collect_connections(conns):
         rows.append({"name": a["name"], "pids": len(a["pids"]), "conns": a["conns"],
                      "samples": list(a["samples"]), "status": status_of(a["name"], view)})
     kids = unproxied_children(view)
@@ -1427,9 +2039,9 @@ def list_rows(view):
     return rows
 
 
-def _list_rows():
+def _list_rows(conns=None):
     view, note = load_rules_view()
-    return list_rows(view), view, note
+    return list_rows(view, conns), view, note
 
 
 def gui_recent_seconds():
@@ -1482,16 +2094,28 @@ def _nonroot_note():
 
 
 def cmd_list(args):
-    rows, view, note = _list_rows()
+    conns = ss_connections()
+    rows, view, note = _list_rows(conns)
     for n in (_nonroot_note(), note):
         if n:
             print(n)
     if not rows:
         print("当前没有连接外网的进程（已排除回环和局域网地址），代理名单中的程序也没有未代理的子进程。")
         return 0
-    print(table(["进程名", "PID数", "连接数", "状态", "远端示例"],
-                [[r["name"], str(r["pids"]), str(r["conns"]), r["status"], ", ".join(r["samples"])]
+    resolver = resolver_info()
+
+    def dns_col(name):
+        if view is None or not NAME_RE.fullmatch(name):
+            return "-"
+        text, level, _ = dns_badge(dns_route(name, view, resolver, conns), route_of(name, view)[0])
+        text = text[4:]  # 列名已经是 DNS
+        return color(text, "33") if level == "warn" else text
+    print(table(["进程名", "PID数", "连接数", "状态", "DNS", "远端示例"],
+                [[r["name"], str(r["pids"]), str(r["conns"]), r["status"], dns_col(r["name"]), ", ".join(r["samples"])]
                  for r in rows]))
+    if any(dns_col(r["name"]).startswith("直连·明文") and r["status"] == STATUS_PROXY for r in rows):
+        print("DNS 列：代理程序的域名解析以明文直连发出，本地网络能看到访问的域名（连接本身仍走代理）。"
+              "详情：proxyctl dns")
     if any(r["status"] == STATUS_CHILD for r in rows):
         print(CHILD_NOTE)
     return 0
@@ -1814,7 +2438,8 @@ def check_config(ck):
         if w:
             ck.add("WARN", w)
     dial = parsed.global_value("dial_mode")
-    ck.add("INFO", "dial_mode：%s（仅展示，proxyctl 不做 DNS 相关修改）" % (dial if dial else "未设置（默认 domain）"))
+    ck.add("INFO", "dial_mode：%s（仅展示）" % (dial if dial else "未设置（默认 domain）"))
+    ck.add("INFO", "DNS 防泄漏：%s（详情：proxyctl dns）" % ("已开启" if parsed.dns_protected else "未开启"))
     resolve = [o for n, o in parsed.unmanaged_pname_rules() + parsed.entries["direct"] + parsed.entries["safety"]
                if n.startswith("systemd-resolve")]
     ck.add("INFO", "systemd-resolve 的 must_direct 规则：%s（仅展示）"
@@ -2293,6 +2918,90 @@ def cmd_restore(args):
     return transact("restore", compute)
 
 
+def cmd_dns(args):
+    if args.protect:
+        return transact("dns-protect-" + args.protect, lambda t: op_dns_protect(t, args.protect == "on"))
+    view, note = load_rules_view()
+    if note:
+        print(note)
+    if view is not None and "dns" not in view:
+        print("（规则缓存由旧版本生成，缺少 dae 的 DNS 设置，下面按 dae 默认值推断；执行一次 sudo proxyctl rules 即可更新。）")
+    if args.name:
+        validate_name(args.name)
+        names = [args.name]
+    else:
+        names = list((view or {}).get("proxy", []))
+        if not names:
+            print("代理名单为空。可以指定进程名查看：proxyctl dns <进程名>")
+            return 0
+    resolver = resolver_info()
+    dns = (view or {}).get("dns") or {}
+    print("系统 DNS：/etc/resolv.conf → %s" % ("、".join(resolver["nameservers"]) or "（读不到）"))
+    if resolver["kind"] == "resolved":
+        print("systemd-resolved 上游：%s%s" % ("、".join(resolver["upstreams"]) or "（读不到）",
+                                           "（DoT 加密）" if resolver.get("dot") else ""))
+    print("DNS 防泄漏：%s" % ("已开启（国外域名经代理查询）" if dns.get("protect") else
+                            "未开启（开启：sudo proxyctl dns --protect on）"))
+    print("dae：dial_mode = %s；dns 区块：%s" % (
+        dns.get("dial_mode", "domain"),
+        ("上游 %s，默认 %s" % ("、".join(dns.get("upstreams", {})) or "无", dns.get("request_fallback") or "asis"))
+        if dns.get("has_dns") else "未配置（asis：转发给原目标服务器）"))
+    for members, r in dns_groups(names, view, resolver, raw_connections()):
+        print()
+        print(color("【%s】" % "、".join(members), "1"))
+        for i, (title, desc, level) in enumerate(r["steps"], 1):
+            mark = {"ok": color("✓", "32"), "warn": color("!", "33")}.get(level, "·")
+            print("  %s %d. %s：%s" % (mark, i, title, desc))
+        for line in dns_summary(r)[:2]:
+            print("  → %s" % line)
+    print()
+    print("提示：%s" % dns_summary({"facts": {}})[-1])
+    return 0
+
+
+def cmd_export(args):
+    view, note = load_rules_view()
+    if view is None:
+        raise ProxyctlError(note)
+    if not view.get("initialized"):
+        raise ProxyctlError("配置尚未初始化（找不到 proxyctl 管理区块），没有可导出的名单。")
+    if note:
+        print(note, file=sys.stderr)
+    text = export_text(view)
+    if args.file in (None, "-"):
+        sys.stdout.write(text)
+        return 0
+    path = os.path.abspath(args.file)
+    try:
+        _atomic_write_text(path, text)
+    except OSError as e:
+        raise ProxyctlError("无法写入 %s：%s" % (path, e.strerror or e))
+    if os.geteuid() == 0 and os.environ.get("SUDO_UID", "").isdigit():
+        try:  # sudo proxyctl export：文件归调用者所有，而不是 root
+            os.chown(path, int(os.environ["SUDO_UID"]), int(os.environ.get("SUDO_GID", "-1") or -1))
+        except (OSError, ValueError):
+            pass
+    print("已导出到 %s：代理名单 %d 个，直连保护 %d 个。" % (path, len(view.get("proxy", [])), len(view.get("direct", []))))
+    print("文件只含进程名，不含节点或订阅信息。导入：sudo proxyctl import %s" % args.file)
+    return 0
+
+
+def read_import_file(path):
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(IMPORT_MAX_BYTES + 1)
+    except OSError as e:
+        raise ProxyctlError("无法读取导入文件 %s：%s" % (path, e.strerror or e))
+    return parse_import(raw)
+
+
+def cmd_import(args):
+    data = read_import_file(args.file)
+    print("导入 %s（%s）：文件中有代理名单 %d 个，直连保护 %d 个。"
+          % (args.file, "替换现有规则" if args.replace else "合并到现有规则", len(data["proxy"]), len(data["direct"])))
+    return transact("import", lambda t: op_import(t, data, args.replace))
+
+
 # -- GUI ---------------------------------------------------------------------
 
 
@@ -2384,6 +3093,7 @@ GUI_CSS = """
 .tag-direct { color: $ACCENT; background-color: alpha($ACCENT, 0.14); }
 .tag-child { color: $WARN; background-color: alpha($WARN, 0.16); }
 .tag-default { background-color: alpha(currentColor, 0.08); }
+.tag-dns-ok { color: $OK; border: 1px solid alpha($OK, 0.45); }
 .warn-text { color: $WARN; }
 .ok-text { color: $OK; }
 .card-list { border-radius: 10px; border: 1px solid alpha(currentColor, 0.12); }
@@ -2393,7 +3103,8 @@ GUI_CSS = """
 
 # 特权操作成功后的提示（toast）
 GUI_DONE = {"add": "已加入代理名单", "remove": "已从代理名单移除", "protect": "已加入直连保护",
-            "unprotect": "已取消直连保护", "restore": "已恢复备份"}
+            "unprotect": "已取消直连保护", "restore": "已恢复备份", "import": "已导入规则"}
+GUI_DNS_TAG = {"ok": "tag-dns-ok", "warn": "tag-child", "plain": "tag-default"}
 GUI_TAG = {STATUS_PROXY: "tag-proxy", STATUS_DIRECT: "tag-direct", STATUS_CHILD: "tag-child"}
 
 
@@ -2409,6 +3120,8 @@ class ProxyctlGui(object):
         self.proc_sig = None
         self.proc_data = []
         self.rules_sig = None
+        self.dns_sig = None
+        self.resolver_cache = (0.0, None)
         self.hero_sig = None
         self.busy = False
         self.history = {}
@@ -2416,6 +3129,7 @@ class ProxyctlGui(object):
         self.view = None
         self.procs_running = {}
         self.alert = False
+        self.chooser = None
 
     # -- GTK3/GTK4 兼容辅助 ------------------------------------------------------
     def put(self, container, child):
@@ -2559,7 +3273,7 @@ class ProxyctlGui(object):
         self.put(parent, lb)
         return lb
 
-    def row(self, lb, title, subtitle=None, tag=None, suffix=(), dim=False, sub_markup=False, tip=None):
+    def row(self, lb, title, subtitle=None, tag=None, suffix=(), dim=False, sub_markup=False, tip=None, wrap=False):
         """列表中的一行：标题（可带状态标签）＋副标题，右侧放按钮等。"""
         Gtk = self.Gtk
         r = Gtk.ListBoxRow()
@@ -2571,14 +3285,15 @@ class ProxyctlGui(object):
         text.set_valign(Gtk.Align.CENTER)
         line = self.box(spacing=8)
         self.put(line, self.label(title, classes=("row-title",)))
-        if tag:
-            t = self.put(line, self.label(tag[0], classes=("tag", tag[1])))
+        for tg in ([tag] if isinstance(tag, tuple) else tag or []):
+            t = self.put(line, self.label(tg[0], classes=("tag", tg[1])))
             t.set_valign(Gtk.Align.CENTER)
-            if tag[2:]:
-                t.set_tooltip_text(tag[2])
+            if tg[2:]:
+                t.set_tooltip_text(tg[2])
         self.put(text, line)
         if subtitle:
-            s = self.put(text, self.label(subtitle, ellipsize=True, classes=("caption",), markup=sub_markup))
+            s = self.put(text, self.label(subtitle, ellipsize=not wrap, wrap=wrap, classes=("caption",),
+                                          markup=sub_markup))
             if tip:
                 s.set_tooltip_text(tip)
         self.put(hb, text)
@@ -2633,7 +3348,7 @@ class ProxyctlGui(object):
         Gtk.Window.set_default_icon_name("proxyctl")
         self.win = (Adw.ApplicationWindow if Adw else Gtk.ApplicationWindow)(application=app)
         self.win.set_title("按应用代理")
-        self.win.set_default_size(920, 700)
+        self.win.set_default_size(920, int(os.environ.get("PROXYCTL_GUI_HEIGHT", "700")))
 
         # 标题栏：左侧进度，中间页面切换，右侧自检、刷新
         if Adw:
@@ -2660,6 +3375,17 @@ class ProxyctlGui(object):
         header.pack_start(busy)
         self.btn_test = self.button("运行自检", self.on_test,
                                     tooltip="端到端自检：经 SOCKS5、经 dae 代理、默认直连各访问一次外网（约 10 秒）")
+        menu = self.Gio.Menu()
+        menu.append("导入规则…", "app.import")
+        menu.append("导出规则…", "app.export")
+        mb = Gtk.MenuButton()
+        mb.set_menu_model(menu)
+        if self.ver == 4:
+            mb.set_icon_name("open-menu-symbolic")
+        else:
+            mb.set_image(self.image("open-menu-symbolic", 16))
+        mb.set_tooltip_text("导入 / 导出规则（代理名单和直连保护）")
+        header.pack_end(mb)
         header.pack_end(self.btn_test)
         header.pack_end(self.button("", self.force_refresh, icon="view-refresh-symbolic",
                                     tooltip="立即刷新（Ctrl+R）。平时每 3 秒自动刷新。"))
@@ -2668,13 +3394,16 @@ class ProxyctlGui(object):
         self.put(body, self.build_hero())
         self.content = self.stack
         self.put(body, self.stack)
-        procs, rules = self.build_procs_page(), self.build_rules_page()
+        procs, rules, dns = self.build_procs_page(), self.build_rules_page(), self.build_dns_page()
         if Adw:
             self.stack.add_titled_with_icon(procs, "procs", "联网进程", "network-transmit-receive-symbolic")
             self.stack.add_titled_with_icon(rules, "rules", "规则", "view-list-bullet-symbolic")
+            self.stack.add_titled_with_icon(dns, "dns", "DNS", "network-server-symbolic")
         else:
             self.stack.add_titled(procs, "procs", "联网进程")
             self.stack.add_titled(rules, "rules", "规则")
+            self.stack.add_titled(dns, "dns", "DNS")
+        self.stack.connect("notify::visible-child", lambda *_: self.refresh_dns(self.view))
 
         if Adw:
             self.toasts = Adw.ToastOverlay()
@@ -2690,6 +3419,8 @@ class ProxyctlGui(object):
         self.shortcut("refresh", "<Control>r", self.force_refresh)
         self.shortcut("find", "<Control>f", self.focus_search)
         self.shortcut("quit", "<Control>q", self.win.close)
+        self.shortcut("import", "<Control>o", self.on_import)
+        self.shortcut("export", "<Control>s", self.on_export)
 
         self.show(self.win)
         self.refresh()
@@ -2752,6 +3483,12 @@ class ProxyctlGui(object):
         self.put(page, self.scrolled(self.margins(self.clamp(self.rules_box), 0, 16, 20)))
         return page
 
+    def build_dns_page(self):
+        page = self.box(vertical=True, spacing=0)
+        self.dns_box = self.box(vertical=True, spacing=0)
+        self.put(page, self.scrolled(self.margins(self.clamp(self.dns_box), 0, 16, 20)))
+        return page
+
     def focus_search(self):
         self.stack.set_visible_child_name("procs")
         self.search.grab_focus()
@@ -2764,6 +3501,7 @@ class ProxyctlGui(object):
             self.procs_running = running_processes()
             self.refresh_procs(view)
             self.refresh_rules(view, note)
+            self.refresh_dns(view)
             if not self.busy and self.status.get_text().startswith("刷新失败"):
                 self.set_status("")
         except Exception as e:  # noqa  GUI 不能因为一次刷新失败而退出
@@ -2771,7 +3509,8 @@ class ProxyctlGui(object):
         return True
 
     def force_refresh(self):
-        self.proc_sig = self.rules_sig = self.hero_sig = None
+        self.proc_sig = self.rules_sig = self.hero_sig = self.dns_sig = None
+        self.resolver_cache = (0.0, None)
         self.refresh()
 
     def set_status(self, text, busy=False):
@@ -2865,12 +3604,20 @@ class ProxyctlGui(object):
         self.hero.set_tooltip_text("链路状态由健康检查定时器经 SOCKS5 实际访问外网得到：正常时每 2 分钟一次，"
                                    "异常时每 15 秒复查。GUI 只读取结果，自己不发请求。")
 
+    def resolver(self):
+        now = time.monotonic()
+        if now - self.resolver_cache[0] > 30 or self.resolver_cache[1] is None:
+            self.resolver_cache = (now, resolver_info())
+        return self.resolver_cache[1]
+
     def refresh_procs(self, view):
         try:
-            rows = list_rows(view)
+            conns = ss_connections()
+            rows = list_rows(view, conns)
         except ProxyctlError as e:
             self.set_status(str(e))
-            rows = []
+            conns, rows = [], []
+        resolver = self.resolver() if view is not None else None
         rows = merge_recent(self.history, rows, time.monotonic(), gui_recent_seconds())
         data = []
         for r in rows:
@@ -2880,7 +3627,10 @@ class ProxyctlGui(object):
                 # 已消失的行：按当前规则重新计算状态（例如刚刚被加入代理）
                 now_st = status_of(r["name"], view)
                 st = st if (st == STATUS_CHILD and now_st == STATUS_DEFAULT) else now_st
-            data.append((r["name"], r["pids"], r["conns"], st, ", ".join(r["samples"]), gone))
+            dns = None
+            if resolver is not None and NAME_RE.fullmatch(r["name"]):
+                dns = dns_badge(dns_route(r["name"], view, resolver, conns), route_of(r["name"], view)[0])
+            data.append((r["name"], r["pids"], r["conns"], st, ", ".join(r["samples"]), gone, dns))
         self.view = view
         if data != self.proc_sig:
             self.proc_sig = data
@@ -2918,7 +3668,7 @@ class ProxyctlGui(object):
             if not items:
                 continue
             lb = self.group(box, title, len(items), desc)
-            for name, pids, conns, st, samples, gone in items:
+            for name, pids, conns, st, samples, gone, dns in items:
                 st_text = "固定规则" if name in safety and st == STATUS_DIRECT else st
                 tag = (st_text, GUI_TAG.get(st, "tag-default"))
                 if st == STATUS_CHILD:
@@ -2938,7 +3688,10 @@ class ProxyctlGui(object):
                     b = self.button(text, self.priv, sub, tooltip=tip, flat=text != "加入代理")
                     b.set_sensitive(sensitive)
                     btns.append(b)
-                self.row(lb, name, " · ".join(parts), tag=tag, suffix=btns, dim=bool(gone), tip=samples or None)
+                tags = [tag]
+                if dns:
+                    tags.append((dns[0], GUI_DNS_TAG[dns[1]], dns[2]))
+                self.row(lb, name, " · ".join(parts), tag=tags, suffix=btns, dim=bool(gone), tip=samples or None)
                 self.dump.append({"name": name, "status": "固定规则（直连）" if st_text == "固定规则" else st_text,
                                   "gone": bool(gone), "buttons": [[t, s] for t, _, s, _ in acts]})
         note = _nonroot_note()
@@ -2995,6 +3748,82 @@ class ProxyctlGui(object):
         if self.ver == 3:
             box.show_all()
 
+    def refresh_dns(self, view):
+        """DNS 页：只在页面可见时计算（要跑 ss 和 resolvectl）。"""
+        if self.stack.get_visible_child_name() != "dns":
+            return
+        resolver = self.resolver()
+        names = list((view or {}).get("proxy", []))
+        groups = dns_groups(names, view, resolver, raw_connections()) if names else []
+        sig = json.dumps([resolver, (view or {}).get("dns"), groups], ensure_ascii=False, sort_keys=True, default=str)
+        if sig == self.dns_sig:
+            return
+        self.dns_sig = sig
+        box = self.dns_box
+        self.clear(box)
+        dns = (view or {}).get("dns") or {}
+        if view is not None and "dns" not in view:
+            self.put(box, self.margins(self.label(
+                "规则缓存由旧版本生成，缺少 dae 的 DNS 设置，下面按 dae 默认值推断。在终端执行一次 "
+                "sudo proxyctl rules，或在规则页做任意修改后即可更新。", wrap=True, classes=("caption", "warn-text")),
+                14, 4, 0))
+        if not groups:
+            lb = self.group(box, "代理程序的 DNS 走向")
+            self.row(lb, "代理名单为空", "加入代理名单的程序会在这里显示它们的 DNS 走向", dim=True)
+        protect = bool(dns.get("protect"))
+        lb = self.group(box, "DNS 防泄漏")
+        if protect:
+            btn = self.button("关闭", self.priv, ["dns", "--protect", "off"], flat=True,
+                              tooltip="恢复原来的 DNS 走法。dae 会重新加载，走代理的程序会短暂断线。")
+            self.row(lb, "已开启", "国外域名经代理向 %s 查询，运营商看不到；国内和局域网域名照旧查询路由器。"
+                     % PROTECT_DNS_IP, tag=("开启", "tag-proxy"), suffix=[btn], wrap=True)
+        else:
+            btn = self.css(self.button("开启…", self.confirm_dns_protect), "suggested-action")
+            self.row(lb, "未开启", "开启后国外域名的 DNS 经代理查询，运营商看不到代理程序访问了哪些域名。",
+                     suffix=[btn], wrap=True)
+        tags = {"ok": ("正常", "tag-proxy"), "warn": ("注意", "tag-child")}
+        for members, r in groups:
+            lb = self.group(box, "DNS 走向", len(members), "适用于：" + "、".join(members))
+            for i, (title, desc, level) in enumerate(r["steps"], 1):
+                self.row(lb, "%d. %s" % (i, title), desc, tag=tags.get(level), wrap=True)
+            for line in dns_summary(r)[:2]:
+                head, _, rest = line.partition("：")
+                self.row(lb, head, rest, wrap=True)
+        lb = self.group(box, "当前 DNS 设置", desc="上面的结论由这些设置推算得出。")
+        self.row(lb, "系统解析器", "/etc/resolv.conf → %s" % ("、".join(resolver["nameservers"]) or "读不到"))
+        if resolver["kind"] == "resolved":
+            self.row(lb, "systemd-resolved 上游", "%s%s" % ("、".join(resolver["upstreams"]) or "读不到",
+                                                        "（DoT 加密）" if resolver.get("dot") else "（明文）"))
+        self.row(lb, "dae 的 DNS 上游",
+                 ("%s；默认 %s" % ("、".join("%s（%s://%s）" % (k, u["scheme"], u["host"])
+                                            for k, u in dns.get("upstreams", {}).items()) or "无",
+                                  dns.get("request_fallback") or "asis"))
+                 if dns.get("has_dns") else "未配置：按原目标服务器转发（asis）", wrap=True)
+        self.row(lb, "dial_mode", {"ip": "ip：把本地解析的 IP 交给代理节点",
+                                   "domain": "domain：把嗅探到的域名交给代理节点，由节点解析",
+                                   "domain+": "domain+：同 domain，不核对嗅探到的域名",
+                                   "domain++": "domain++：同 domain+，并按嗅探到的域名重新分流"}.get(
+            dns.get("dial_mode", "domain"), dns.get("dial_mode", "domain")))
+        self.put(box, self.margins(self.label(dns_summary({"facts": {}})[-1], wrap=True, classes=("caption",)),
+                                   12, 4, 0))
+        if self.ver == 3:
+            box.show_all()
+
+    def confirm_dns_protect(self):
+        self.dialog("开启 DNS 防泄漏", "\n".join([
+            "开启后：",
+            "  · 国外域名（不在 geosite:cn 列表里的）由 dae 经代理向 %s 查询，运营商看不到；" % PROTECT_DNS_IP,
+            "  · 国内和局域网域名照旧查询原来的 DNS（路由器），不受影响。",
+            "",
+            "代价：",
+            "  · 对全系统生效，直连程序查询国外域名也会经过代理，第一次查询慢约 0.4 秒，之后有缓存；",
+            "  · 代理不可用时，全系统的国外域名会暂时解析失败（国内域名不受影响）；",
+            "  · 直连访问国外网站时，拿到的服务器地址按代理出口的位置分配，可能不是离你最近的。",
+            "",
+            "proxyctl 会在 dae 配置末尾加入一个带标记的 dns 区块，并在 routing 中加入 %s；" % PROTECT_ROUTE_RULE,
+            "随时可以在这里关闭，关闭后配置恢复原样。开启和关闭都会让 dae 重新加载，走代理的程序会短暂断线。",
+        ]), warn=True, actions=[("开启", lambda: self.priv(["dns", "--protect", "on"]), True)])
+
     # -- 动作 --------------------------------------------------------------------
     def on_manual(self, sub):
         name = self.entry.get_text().strip()
@@ -3036,7 +3865,10 @@ class ProxyctlGui(object):
         elif rc == 0:
             if subargs[0] in ("add", "protect"):
                 self.entry.set_text("")
-            msg = "%s：%s" % (GUI_DONE.get(subargs[0], "已完成"), " ".join(subargs[1:]))
+            if subargs[0] == "dns":
+                msg = "已%s DNS 防泄漏" % ("开启" if subargs[-1] == "on" else "关闭")
+            else:
+                msg = "%s：%s" % (GUI_DONE.get(subargs[0], "已完成"), " ".join(subargs[1:]))
             if "重新加载" in out:
                 msg += "，相关程序会短暂重连"
             self.toast(msg, detail=out.strip() or None, title=title)
@@ -3044,6 +3876,94 @@ class ProxyctlGui(object):
             self.dialog(title, out.strip() or "(无输出)", error=True)
         self.force_refresh()
         return False
+
+    def pick_file(self, save, title, cb, name=None):
+        """选择文件，选好后 cb(路径)。GTK ≥ 4.10 用 FileDialog，否则用 FileChooserNative。"""
+        Gtk = self.Gtk
+        if self.ver == 4 and hasattr(Gtk, "FileDialog"):
+            fd = Gtk.FileDialog(title=title, modal=True)
+            flt = Gtk.FileFilter()
+            flt.set_name("JSON 文件")
+            flt.add_pattern("*.json")
+            filters = self.Gio.ListStore.new(Gtk.FileFilter)
+            filters.append(flt)
+            fd.set_filters(filters)
+            if name:
+                fd.set_initial_name(name)
+
+            def done(dlg, res):
+                try:
+                    f = (dlg.save_finish if save else dlg.open_finish)(res)
+                except self.GLib.Error:
+                    return  # 用户取消
+                if f is not None and f.get_path():
+                    cb(f.get_path())
+            (fd.save if save else fd.open)(self.win, None, done)
+            return
+        action = Gtk.FileChooserAction.SAVE if save else Gtk.FileChooserAction.OPEN
+        fc = Gtk.FileChooserNative.new(title, self.win, action, None, None)
+        if name:
+            fc.set_current_name(name)
+            if self.ver == 3:
+                fc.set_do_overwrite_confirmation(True)
+
+        def resp(dlg, r):
+            if r == Gtk.ResponseType.ACCEPT:
+                f = dlg.get_file()
+                if f is not None and f.get_path():
+                    cb(f.get_path())
+            self.chooser = None
+        fc.connect("response", resp)
+        self.chooser = fc  # 保持引用，否则对话框会被回收
+        fc.show()
+
+    def on_export(self):
+        view = self.view
+        if not view or not view.get("initialized"):
+            self.dialog("无法导出", "当前读不到名单（配置未初始化或没有规则缓存）。", error=True)
+            return
+
+        def write(path):
+            try:
+                _atomic_write_text(path, export_text(view))
+            except OSError as e:
+                self.dialog("导出失败", "无法写入 %s：%s" % (path, e.strerror or e), error=True)
+                return
+            self.toast("已导出：代理 %d 个，直连保护 %d 个" % (len(view.get("proxy", [])), len(view.get("direct", []))),
+                       detail="已保存到 %s\n文件只含进程名，不含节点或订阅信息。" % path, title="导出规则")
+        self.pick_file(True, "导出规则", write,
+                       name="proxyctl-%s.json" % datetime.date.today().strftime("%Y%m%d"))
+
+    def on_import(self):
+        if self.busy:
+            return
+        self.pick_file(False, "导入规则", self.confirm_import)
+
+    def confirm_import(self, path):
+        try:
+            data = read_import_file(path)
+        except ProxyctlError as e:
+            self.dialog("无法导入", str(e), error=True)
+            return
+        view = self.view or {}
+        cur_p, cur_d = view.get("proxy", []), view.get("direct", [])
+        lines = ["文件：%s" % path,
+                 "文件中有代理名单 %d 个，直连保护 %d 个。" % (len(data["proxy"]), len(data["direct"])), ""]
+        actions = []
+        for label, replace, main in (("合并", False, True), ("替换", True, False)):
+            p, d, msgs = import_plan(cur_p, cur_d, data, replace)
+            lines.append("【%s】%s" % (label, "只新增，保留现有规则" if not replace else "现有规则改为与文件完全一致"))
+            lines.extend("  " + m for m in (msgs or ["名单无变化"]))
+            lines.append("")
+            if (p, d) != (cur_p, cur_d):
+                actions.append((label, lambda r=replace: self.priv(["import", path] + (["--replace"] if r else [])), main))
+        if not actions:
+            self.dialog("导入规则", "\n".join(lines + ["规则已与文件一致，无需导入。"]))
+            return
+        if len(actions) == 1:
+            actions[0] = actions[0][:2] + (True,)
+        lines.append("导入后 dae 会重新加载，正在走代理的程序会短暂断线并自动重连。")
+        self.dialog("导入规则", "\n".join(lines).rstrip(), warn=True, actions=actions)
 
     def on_test(self):
         self.btn_test.set_sensitive(False)
@@ -3063,8 +3983,11 @@ class ProxyctlGui(object):
                     out.strip(), error=rc != 0, warn=warn)
         return False
 
-    def dialog(self, title, text, error=False, warn=False):
-        """显示命令输出：顶部一行结论，下面是可复制的原始输出。"""
+    def dialog(self, title, text, error=False, warn=False, actions=()):
+        """显示命令输出：顶部一行结论，下面是可复制的原始输出。
+
+        actions：额外按钮 [(文字, 回调, 是否主按钮), ...]，点击后关闭对话框再执行回调。
+        """
         Gtk = self.Gtk
         d = Gtk.Window()
         d.set_title(title)
@@ -3094,8 +4017,13 @@ class ProxyctlGui(object):
         btns.set_halign(Gtk.Align.END)
         copy = self.put(btns, self.button("复制输出", self.copy_text, text))
         copy.connect("clicked", lambda _w: copy.set_label("已复制"))
-        ok = self.put(btns, self.button("关闭", d.destroy))
-        self.css(ok, "suggested-action")
+        ok = self.put(btns, self.button("取消" if actions else "关闭", d.destroy))
+        for text_, cb, main in actions:
+            b = self.put(btns, self.button(text_, lambda cb=cb: (d.destroy(), cb())))
+            if main:
+                ok = self.css(b, "suggested-action")
+        if not actions:
+            self.css(ok, "suggested-action")
         self.put(box, btns)
         self.put(d, box)
         self.show(d)
@@ -3162,6 +4090,16 @@ def build_parser():
     sp = sub.add_parser("guard-desktop", help="为 .desktop 启动器生成带启动守卫的覆盖副本")
     sp.add_argument("desktop", help="desktop 文件名，例如 signal-desktop.desktop")
     sp.add_argument("--undo", action="store_true", help="撤销")
+    sp = sub.add_parser("dns", help="显示代理名单中程序的 DNS 走向；--protect 开关 DNS 防泄漏")
+    sp.add_argument("name", nargs="?", help="只看这个进程名（可以不在代理名单中）")
+    sp.add_argument("--protect", choices=("on", "off"),
+                    help="DNS 防泄漏：on = 国外域名经代理查询，运营商看不到；off = 恢复原来的走法（需要 root）")
+    sp = sub.add_parser("export", help="导出规则：代理名单和直连保护（JSON，只含进程名）")
+    sp.add_argument("file", nargs="?", help="输出文件；省略或为 - 时输出到终端")
+    sp = sub.add_parser("import", help="从导出文件导入规则（需要 root）")
+    sp.add_argument("file", help="proxyctl export 生成的 JSON 文件")
+    sp.add_argument("--replace", action="store_true",
+                    help="用文件内容替换现有规则（默认是合并：只新增，不删除）")
     sub.add_parser("backups", help="列出配置备份")
     sp = sub.add_parser("restore", help="恢复备份（需要 root）")
     sp.add_argument("backup", help="备份名")
@@ -3174,8 +4112,9 @@ HANDLERS = {
     "unprotect": cmd_unprotect, "rules": cmd_rules, "list": cmd_list, "pick": cmd_pick,
     "check": cmd_check, "test": cmd_test, "run": cmd_run, "guard-desktop": cmd_guard_desktop,
     "backups": cmd_backups, "restore": cmd_restore, "gui": cmd_gui,
+    "export": cmd_export, "import": cmd_import, "dns": cmd_dns,
 }
-WRITE_CMDS = {"init", "add", "remove", "protect", "unprotect", "restore"}
+WRITE_CMDS = {"init", "add", "remove", "protect", "unprotect", "restore", "import"}
 
 
 def _backups_need_root():
@@ -3192,6 +4131,13 @@ def main(argv=None):
                 validate_name(args.name)  # 提权前先拒绝明显非法的输入
             if args.cmd == "add" and is_blacklisted(args.name):
                 raise ProxyctlError("拒绝加入代理名单。" + blacklist_reason(args.name))
+            if args.cmd == "import":
+                args.file = os.path.abspath(args.file)
+                argv = ["import", args.file] + (["--replace"] if args.replace else [])
+                if os.access(args.file, os.R_OK):
+                    read_import_file(args.file)  # 提权前先检查文件，坏文件不触发 sudo 密码提示
+            ensure_root(argv, lambda: not can_write_config())
+        elif args.cmd == "dns" and args.protect:
             ensure_root(argv, lambda: not can_write_config())
         elif args.cmd == "backups":
             ensure_root(argv, _backups_need_root)

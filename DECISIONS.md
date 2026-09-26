@@ -201,6 +201,45 @@
 51d. `check` 比较 proxyctl 的 SOCKS 地址与 dae 配置中出现的 socks5:// 地址（localhost 视为 127.0.0.1）；
     配置里有 socks5 节点但都不相同时报 WARN。没有任何 socks5 节点时不报（节点可能来自订阅或其他协议）。
 
+## 名单导入 / 导出
+
+51e. 只导出/导入 proxy 和 direct 两个名单（JSON：`format`、`version`、`exported`、`proxy`、`direct`），
+    不导出整个 dae 配置——那里有节点链接等敏感信息，而且各机器的节点、DNS 设置本来就不同。安全区块由 proxyctl 维护，不导出。
+51f. 导入文件整体校验：非 JSON、超过 1 MB、版本比当前新、名字不合法（防止注入 dae 语法）、同一名字同时出现在两个名单中，
+    都整体拒绝、不做任何修改。手写的 `{"proxy": [...]}`（没有 format / version）也接受。
+51g. 默认合并（只增不删）；`--replace` 才会删除文件中没有的条目。合并时与现有名单冲突的名字（例如文件要代理、本机是直连保护）
+    **跳过并提示**，不自动改变方向；黑名单名称和安全区块中的名字在两种模式下都跳过。
+    因此旧版本手工加入过的黑名单名称（如 curl）在 `--replace` 往返后会消失，这是有意为之。
+51h. 在终端里，import 在提权前就读取并校验文件，坏文件不会触发 sudo 密码提示；文件路径转成绝对路径后再交给 sudo。
+    GUI 在授权前用当前名单预览合并和替换两种结果，名单不会变化的选项不显示按钮。
+51i. export 不需要 root（非 root 时读规则缓存）。用 sudo 导出时，文件属主改回调用者。
+
+## DNS 走向
+
+51j. 推演依据 dae 的行为（文档与源码 control_plane.go 的 chooseBestDnsDialerSnapshot）：发往 53 端口的流量被 dae 的
+    DNS 模块接管，只有命中 must_direct 的不接管；dae 向上游查询时，用“发出请求的进程名 + 上游地址”再匹配一次 routing。
+    因此 stub 模式下（resolv.conf 指向 127.0.0.53）决定 DNS 走向的是 systemd-resolve 进程的规则，而不是应用自己的规则。
+51k. 只根据进程名规则、单独的 dip 规则（见 51r）和 fallback 推演；routing 中的 dport / l4proto / 组合规则等不推演，
+    只在页面上列出提示，避免给出看似精确、实际错误的结论。
+    dns.routing.request 中的 qname 规则同样只提示条数，结论按 fallback 上游给出。
+51l. 规则缓存（0644，所有人可读）只保存 DNS 上游的协议、主机和端口，丢掉路径和用户信息，因为 DoH 地址的路径里可能带私有 ID。
+51m. “程序自己发 DNS”只能从 ss 快照中看到正在进行的 53 / 853 连接，短暂的 UDP 查询很可能抓不到；程序自带的 DoH 无法和普通 HTTPS 区分，
+    只在页面底部统一说明。
+51n. GUI 的 DNS 页只在可见时计算（需要执行 ss 和 resolvectl），resolvectl 的结果缓存 30 秒。
+51o. DNS 防泄漏只能按域名分流：stub 模式下所有 DNS 都由 systemd-resolve 发出，dae 无法区分替哪个程序查询。
+    国内域名用 geosite:cn 判断，局域网与反向解析用 geosite:private 和 suffix: lan，其余走 8.8.8.8。
+    上游用 `tcp+udp://8.8.8.8:53` 而不是 DoH：查询已经在代理隧道里，运营商看不到；用 IP 写上游，路由才能用 dip 规则可靠地命中，
+    不需要先解析 DoH 服务器的域名。v2rayN 的 mixed 入站开启了 UDP；实测经代理的 TCP 查询约 0.4 秒。
+51p. 修改范围用带标记的区域限定：routing 中紧跟代理名单区块的 `proxyctl:dns-route`，以及文件末尾的顶层 `proxyctl:dns`。
+    两个区域必须同时存在，位置不对或只剩一半都视为标记损坏，所有写命令拒绝修改。
+    dip 规则排在进程名规则之后：直连保护名单中的程序即使自己查询 8.8.8.8 也保持直连，这是它们本来的意思。
+    配置中已有用户自己的顶层 dns 区块时拒绝开启，因为合并两份 DNS 设置很容易出错。
+    关闭时删除两个区域和 proxyctl 加入的空行，开启再关闭后配置与原来逐字节一致（有测试）。
+51q. 生成的配置用真实 dae 校验过：`qname(geosite:cn) -> asis` 和 `qname(suffix: …) -> asis` 分成两行时，dae 2.1.1 合并规则后
+    报 `addQName: unsupported key`，所以写成一行 `qname(geosite:private, geosite:cn, suffix: lan) -> asis`。
+51r. 推演 DNS 走向时会计算单独的 `dip(...) -> 出口` 规则（只认 IP / CIDR，geoip 等不推演），因此开启防泄漏后 DNS 标签显示“DNS 代理”。
+    DNS 走代理时标签不再区分明文和加密：查询在代理隧道里，对运营商来说都不可见。
+
 ## 测试
 
 52. 真实 `dae validate`：非 root 下可以执行（已验证），因此作为测试的一部分；若将来在没有 dae 的机器上运行，该组测试自动跳过。
