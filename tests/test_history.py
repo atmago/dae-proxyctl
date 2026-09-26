@@ -1,4 +1,4 @@
-"""链路延迟记录：探测时写入、汇总、异常时段、内核切换、proxyctl history 与 GUI 延迟页。"""
+"""链路延迟记录：探测时写入、汇总、异常时段、内核切换、proxyctl history 与 GUI 延迟页；GUI“关于”窗口。"""
 
 import json
 import os
@@ -156,6 +156,23 @@ class TestHistoryGui(FakeEnv):
         self.assertEqual(rc, 0, err)
         self.assertNotIn("Traceback", err)
         self.assertNotIn("Error", err)
+
+
+class TestAboutGui(FakeEnv):
+    @unittest.skipUnless(_has_gui(), "没有图形环境或 PyGObject")
+    def test_about_opens(self):
+        self.write_config(INIT)
+        env = {"PROXYCTL_GUI_AUTOQUIT": "2", "PROXYCTL_GUI_ABOUT": "1"}
+        if os.environ.get("XDG_RUNTIME_DIR"):
+            env["XDG_RUNTIME_DIR"] = os.environ["XDG_RUNTIME_DIR"]
+        rc, out, err = self.run_cli("gui", extra_env=env, timeout=60)
+        if "无法连接图形显示" in err:
+            self.skipTest("图形显示不可用")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(P.HOMEPAGE, "https://github.com/atmago/dae-proxyctl")
+        self.assertIn("本程序遵循 MIT 许可证", P.LICENSE_MARKUP)
+        self.assertNotIn("担保", P.LICENSE_MARKUP)
 
 
 if __name__ == "__main__":

@@ -112,10 +112,10 @@ echo "  $ICON"
 cat > "$DESKTOP.tmp" <<'EOF'
 [Desktop Entry]
 Type=Application
-Name=proxyctl
-Name[zh_CN]=按应用代理（proxyctl）
+Name=Proxyctl
 Comment=Manage per-application proxy rules for dae
-Comment[zh_CN]=管理 dae 的按应用代理名单
+Comment[zh_CN]=管理 dae 的按应用代理规则
+Keywords=proxy;dae;代理;按应用代理;分流;
 Exec=/usr/local/bin/proxyctl gui
 Icon=proxyctl
 StartupWMClass=io.github.proxyctl.gui
@@ -198,7 +198,7 @@ cat <<EOF
 安装完成。后续步骤：
   1. 端到端自检：            proxyctl test
   2. 完整健康检查：          sudo proxyctl check
-  3. 查看正在联网的进程：    proxyctl list      （或打开“按应用代理（proxyctl）”图形界面）
+  3. 查看正在联网的进程：    proxyctl list      （或在应用列表里打开 Proxyctl 图形界面）
   4. 加入代理名单：          proxyctl add <进程名>
   5. 给 Signal 加启动守卫：  proxyctl guard-desktop signal-desktop.desktop
      （以你自己的身份执行，不要加 sudo）

@@ -25,6 +25,10 @@ import time
 import unicodedata
 
 VERSION = "1.1.0"
+AUTHOR = "atmago"
+HOMEPAGE = "https://github.com/atmago/dae-proxyctl"
+# “关于”窗口“法律信息”页的许可证说明（替换 libadwaita 默认的“本程序不作任何担保”那句）
+LICENSE_MARKUP = '本程序遵循 MIT 许可证，详情请见 <a href="%s/blob/main/LICENSE">MIT 许可证</a>。' % HOMEPAGE
 
 # ---------------------------------------------------------------------------
 # 路径与外部程序（全部可用环境变量覆盖，便于测试）
@@ -3579,7 +3583,8 @@ class ProxyctlGui(object):
         act = self.Gio.SimpleAction.new(name, None)
         act.connect("activate", lambda *_: cb())
         self.app.add_action(act)
-        self.app.set_accels_for_action("app." + name, [accel])
+        if accel:
+            self.app.set_accels_for_action("app." + name, [accel])
 
     # -- 构建界面 ----------------------------------------------------------------
     def on_activate(self, app):
@@ -3587,7 +3592,7 @@ class ProxyctlGui(object):
         self.load_css()
         Gtk.Window.set_default_icon_name("proxyctl")
         self.win = (Adw.ApplicationWindow if Adw else Gtk.ApplicationWindow)(application=app)
-        self.win.set_title("按应用代理")
+        self.win.set_title("Proxyctl")
         self.win.set_default_size(920, int(os.environ.get("PROXYCTL_GUI_HEIGHT", "700")))
 
         # 标题栏：左侧进度，中间页面切换，右侧自检、刷新
@@ -3618,13 +3623,16 @@ class ProxyctlGui(object):
         menu = self.Gio.Menu()
         menu.append("导入规则…", "app.import")
         menu.append("导出规则…", "app.export")
+        about = self.Gio.Menu()
+        about.append("关于 proxyctl", "app.about")
+        menu.append_section(None, about)
         mb = Gtk.MenuButton()
         mb.set_menu_model(menu)
         if self.ver == 4:
             mb.set_icon_name("open-menu-symbolic")
         else:
             mb.set_image(self.image("open-menu-symbolic", 16))
-        mb.set_tooltip_text("导入 / 导出规则（代理名单和直连保护）")
+        mb.set_tooltip_text("主菜单：导入 / 导出规则、关于")
         header.pack_end(mb)
         header.pack_end(self.btn_test)
         header.pack_end(self.button("", self.force_refresh, icon="view-refresh-symbolic",
@@ -3664,9 +3672,12 @@ class ProxyctlGui(object):
         self.shortcut("quit", "<Control>q", self.win.close)
         self.shortcut("import", "<Control>o", self.on_import)
         self.shortcut("export", "<Control>s", self.on_export)
+        self.shortcut("about", None, self.on_about)
 
         self.show(self.win)
         self.refresh()
+        if os.environ.get("PROXYCTL_GUI_ABOUT"):  # 开发用：启动后直接打开“关于”
+            self.on_about()
         if os.environ.get("PROXYCTL_GUI_PAGE"):  # 开发用：直接打开指定页面
             self.stack.set_visible_child_name(os.environ["PROXYCTL_GUI_PAGE"])
         self.GLib.timeout_add_seconds(3, self.refresh)
@@ -4519,6 +4530,54 @@ class ProxyctlGui(object):
         fc.connect("response", resp)
         self.chooser = fc  # 保持引用，否则对话框会被回收
         fc.show()
+
+    def selectable_links(self, root):
+        """让“详细信息”里含 GitHub 地址的说明文字可以选中复制（链接本身点击即可打开，右键可复制链接地址）。
+        libadwaita 没有提供这个选项，只能在它的控件树里找到那个标签；找不到也不影响使用。"""
+        stack = [root]
+        while stack:
+            w = stack.pop()
+            if isinstance(w, self.Gtk.Label) and HOMEPAGE in (w.get_label() or ""):
+                w.set_selectable(True)
+            c = w.get_first_child()
+            while c is not None:
+                stack.append(c)
+                c = c.get_next_sibling()
+        return False  # 作为 idle 回调只执行一次
+
+    def on_about(self):
+        """“关于”窗口：图标、名称、版本、作者、GitHub 地址和许可证。"""
+        Gtk, Adw = self.Gtk, self.Adw
+        comments = "按应用代理：基于 dae 的 Proxifier 式代理管理工具。dae 负责分流，proxyctl 只管理规则、做健康检查。"
+        # AdwAboutDialog 的 comments 支持 Pango 标记，链接可以点击，右键可以复制链接地址
+        link = 'GitHub：<a href="%s">%s</a>' % (HOMEPAGE, HOMEPAGE)
+        info = dict(application_name="Proxyctl", application_icon="proxyctl", version=VERSION,
+                    developer_name=AUTHOR, website=HOMEPAGE, issue_url=HOMEPAGE + "/issues",
+                    copyright="© 2026 %s" % AUTHOR, license=LICENSE_MARKUP,
+                    comments=comments + "\n\n" + link)
+        if Adw and hasattr(Adw, "AboutDialog"):  # libadwaita 1.5 起
+            dlg = Adw.AboutDialog(**info)
+            dlg.add_link("版本记录", HOMEPAGE + "/releases")
+            dlg.present(self.win)
+            self.GLib.idle_add(self.selectable_links, dlg)
+            return dlg
+        if Adw and hasattr(Adw, "AboutWindow"):
+            dlg = Adw.AboutWindow(transient_for=self.win, modal=True, **info)
+            dlg.add_link("版本记录", HOMEPAGE + "/releases")
+            dlg.present()
+            self.GLib.idle_add(self.selectable_links, dlg)
+            return dlg
+        dlg = Gtk.AboutDialog(program_name=info["application_name"], logo_icon_name="proxyctl", version=VERSION,
+                              authors=[AUTHOR], website=HOMEPAGE, website_label="GitHub：atmago/dae-proxyctl",
+                              copyright=info["copyright"], comments=comments, wrap_license=True,
+                              license="本程序遵循 MIT 许可证，详情请见 %s/blob/main/LICENSE" % HOMEPAGE,
+                              transient_for=self.win, modal=True)
+        if self.ver == 4:
+            dlg.present()
+        else:
+            dlg.connect("response", lambda d, *_: d.destroy())
+            dlg.show()
+        return dlg
 
     def on_export(self):
         view = self.view
