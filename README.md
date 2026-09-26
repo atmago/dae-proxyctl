@@ -333,7 +333,7 @@ proxyctl test
 ```
 dae 服务状态：active；SOCKS5 127.0.0.1:10808：监听中
 [PASS] 1. 通过 SOCKS5 直接访问 https://ifconfig.me/ip，得到代理出口 IP：203.0.113.7
-       说明 v2rayN/xray 与远程节点工作正常。
+       说明代理客户端（v2rayN 等）与远程节点工作正常。
 [PASS] 2. proxyctl-probe 得到 203.0.113.7，与代理出口一致
        说明 dae 按进程名把名单程序送进了代理。
 [PASS] 3. proxyctl-direct 得到 198.51.100.8，与代理出口不同（默认直连正常）

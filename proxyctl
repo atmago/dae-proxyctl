@@ -2658,7 +2658,7 @@ def cmd_test(args):
     proxy_ip, err, notes = _curl_ip([curl_bin(), "-x", "socks5h://%s" % socks_str()])
     if proxy_ip:
         report(True, "1. 通过 SOCKS5 直接访问 %s，得到代理出口 IP：%s" % (url, proxy_ip),
-               ["说明 v2rayN/xray 与远程节点工作正常。"] + notes)
+               ["说明代理客户端（v2rayN 等）与远程节点工作正常。"] + notes)
     else:
         report(False, "1. 通过 SOCKS5 %s 访问 %s 失败" % (socks_str(), url),
                [err, "说明 xray 未运行、节点不可用或 SOCKS 端口不对。此时名单中的程序无法联网（故障即断开）。"])
