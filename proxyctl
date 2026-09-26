@@ -3332,6 +3332,10 @@ GUI_CSS = """
 .tag-child { color: $WARN; background-color: alpha($WARN, 0.16); }
 .tag-default { background-color: alpha(currentColor, 0.08); }
 .tag-bad { color: $BAD; background-color: alpha($BAD, 0.14); }
+.capsule { border-radius: 999px; padding: 4px 16px; }
+.capsule-group > button { padding: 4px 14px; }
+.capsule-group > button:first-child { border-radius: 999px 0 0 999px; padding-left: 16px; }
+.capsule-group > button:last-child { border-radius: 0 999px 999px 0; padding-right: 16px; }
 .chart-card { border-radius: 12px; border: 1px solid alpha(currentColor, 0.12); padding: 6px 4px 2px 0; }
 .tag-dns-ok { color: $OK; border: 1px solid alpha($OK, 0.45); }
 .warn-text { color: $WARN; }
@@ -3453,6 +3457,7 @@ class ProxyctlGui(object):
         return lb
 
     def button(self, text, cb, *data, tooltip=None, icon=None, flat=False):
+        """文字按钮一律用胶囊样式（常驻底色，一眼能看出可以点）；只有图标按钮才用 flat。"""
         Gtk = self.Gtk
         if icon:
             b = Gtk.Button.new_from_icon_name(icon) if self.ver == 4 else \
@@ -3462,8 +3467,11 @@ class ProxyctlGui(object):
         b.connect("clicked", lambda _w: cb(*data))
         if tooltip:
             b.set_tooltip_text(tooltip)
-        if flat:
-            self.css(b, "flat")
+        if icon:
+            if flat:
+                self.css(b, "flat")
+        else:
+            self.css(b, "capsule")
         b.set_valign(Gtk.Align.CENTER)
         return b
 
@@ -3590,6 +3598,16 @@ class ProxyctlGui(object):
     def on_activate(self, app):
         Gtk, Adw = self.Gtk, self.Adw
         self.load_css()
+        # 从仓库直接运行（没有安装图标）时，让图标主题也能找到仓库里的 proxyctl.svg
+        here = os.path.dirname(os.path.realpath(__file__))
+        if os.path.exists(os.path.join(here, "proxyctl.svg")):
+            try:
+                if self.ver == 4:
+                    Gtk.IconTheme.get_for_display(self.Gdk.Display.get_default()).add_search_path(here)
+                else:
+                    Gtk.IconTheme.get_default().append_search_path(here)
+            except Exception:  # noqa  找不到图标只影响显示
+                pass
         Gtk.Window.set_default_icon_name("proxyctl")
         self.win = (Adw.ApplicationWindow if Adw else Gtk.ApplicationWindow)(application=app)
         self.win.set_title("Proxyctl")
@@ -3613,6 +3631,9 @@ class ProxyctlGui(object):
                 header.set_show_close_button(True)
         self.stack.set_vexpand(True)
         busy = self.box(spacing=8)
+        logo = self.put(busy, self.image("proxyctl", 22))  # 左上角的软件图标
+        logo.set_margin_start(4)
+        logo.set_tooltip_text("Proxyctl %s" % VERSION)
         self.spinner = self.put(busy, Gtk.Spinner())
         self.status = self.put(busy, self.label(classes=("caption",)))
         self.status.set_ellipsize(self.Pango.EllipsizeMode.END)
@@ -3624,7 +3645,7 @@ class ProxyctlGui(object):
         menu.append("导入规则…", "app.import")
         menu.append("导出规则…", "app.export")
         about = self.Gio.Menu()
-        about.append("关于 proxyctl", "app.about")
+        about.append("关于 Proxyctl", "app.about")
         menu.append_section(None, about)
         mb = Gtk.MenuButton()
         mb.set_menu_model(menu)
@@ -3752,7 +3773,7 @@ class ProxyctlGui(object):
         top.set_margin_top(14)
         self.chain_summary = self.put(top, self.label(wrap=True, classes=("caption",)))
         self.chain_summary.set_hexpand(True)
-        seg = self.css(self.box(spacing=0), "linked")
+        seg = self.css(self.box(spacing=0), "linked", "capsule-group")
         seg.set_valign(Gtk.Align.CENTER)
         self.chain_toggles = {}
         for hours, text in ((6, "6 小时"), (24, "24 小时"), (HISTORY_DAYS * 24, "%d 天" % HISTORY_DAYS)):
@@ -4299,7 +4320,9 @@ class ProxyctlGui(object):
                 acts = gui_row_actions(name, st, self.view)
                 btns = []
                 for text, sub, sensitive, tip in acts:
-                    b = self.button(text, self.priv, sub, tooltip=tip, flat=text != "加入代理")
+                    b = self.button(text, self.priv, sub, tooltip=tip)
+                    if text == "加入代理":
+                        self.css(b, "suggested-action")
                     b.set_sensitive(sensitive)
                     btns.append(b)
                 tags = [tag]
@@ -4349,7 +4372,7 @@ class ProxyctlGui(object):
                 elif long_name_warning(name):
                     sub += '　<span foreground="%s">⚠ 超过 15 个字符，可能不会命中</span>' % GUI_DOT["warn"]
                     tip = long_name_warning(name)
-                rm = self.button("移除", self.priv, [cmd, name], tooltip=reload_tip, flat=True)
+                rm = self.button("移除", self.priv, [cmd, name], tooltip=reload_tip)
                 self.row(lb, name, sub, suffix=[rm], sub_markup=True, tip=tip)
         safety = view.get("safety", [])
         lb = self.group(box, "固定规则", len(safety), "由 proxyctl 维护：代理核心自身必须直连，自检探针走代理。不能删除。")
@@ -4387,7 +4410,7 @@ class ProxyctlGui(object):
         protect = bool(dns.get("protect"))
         lb = self.group(box, "DNS 防泄漏")
         if protect:
-            btn = self.button("关闭", self.priv, ["dns", "--protect", "off"], flat=True,
+            btn = self.button("关闭", self.priv, ["dns", "--protect", "off"],
                               tooltip="恢复原来的 DNS 走法。dae 会重新加载，走代理的程序会短暂断线。")
             self.row(lb, "已开启", "国外域名经代理向 %s 查询，运营商看不到；国内和局域网域名照旧查询路由器。"
                      % PROTECT_DNS_IP, tag=("开启", "tag-proxy"), suffix=[btn], wrap=True)
