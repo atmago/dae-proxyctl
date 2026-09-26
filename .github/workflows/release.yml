@@ -1,0 +1,53 @@
+name: release
+
+# 推送 vX.Y.Z 标签时，用 CHANGELOG.md 中对应版本的段落创建 GitHub Release。
+# 也会补建此前还没有 Release 的版本标签（只要 CHANGELOG 里有对应段落）。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check version number
+        if: github.event_name == 'push'
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' proxyctl)
+          if [ "v$ver" != "$tag" ]; then
+            echo "::error::标签 $tag 与 proxyctl 中的 VERSION ($ver) 不一致"
+            exit 1
+          fi
+
+      - name: Create releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest=$(git tag -l 'v*' --sort=-v:refname | head -n1)
+          for tag in $(git tag -l 'v*' --sort=v:refname); do
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "$tag 已有 Release，跳过"
+              continue
+            fi
+            # 取出 CHANGELOG.md 中 "## vX.Y.Z" 到下一个 "## " 之间的内容
+            awk -v t="$tag" '
+              /^## / { if (found) exit; if ($2 == t) { found = 1; next } }
+              found { print }
+            ' CHANGELOG.md > notes.md
+            if [ ! -s notes.md ]; then
+              echo "::warning::CHANGELOG.md 中没有 $tag 的段落，跳过"
+              continue
+            fi
+            flag="--latest=false"
+            [ "$tag" = "$latest" ] && flag="--latest"
+            gh release create "$tag" --title "proxyctl $tag" --notes-file notes.md --verify-tag $flag
+          done

@@ -13,6 +13,8 @@ proxyctl 的体验接近 Windows 上的 Proxifier：它负责管理 [dae](https:
 > 其他发行版、桌面环境或代理核心（sing-box、mihomo）理论上可用，欢迎反馈问题。
 > 界面和输出目前只有中文。
 
+每个版本改了什么，见 [CHANGELOG.md](CHANGELOG.md) 或 [Releases](https://github.com/atmago/dae-proxyctl/releases) 页面。
+
 ---
 
 ## 目录
@@ -732,8 +734,11 @@ python3 -m unittest
 `PROXYCTL_CONF`、`PROXYCTL_CONFIG`、`PROXYCTL_DAE_BIN`、`PROXYCTL_SYSTEMCTL`、`PROXYCTL_STATE_DIR`、`PROXYCTL_SOCKS`，
 以及 `PROXYCTL_SS`、`PROXYCTL_CURL`、`PROXYCTL_LIBDIR`、`PROXYCTL_NOTIFY_SEND`、`PROXYCTL_PKEXEC`、
 `PROXYCTL_SELF`、`PROXYCTL_PROC`、`PROXYCTL_SERVICE`、`PROXYCTL_RELOAD_SETTLE`、`PROXYCTL_LOCK_TIMEOUT`、
-`PROXYCTL_NO_ESCALATE`、`PROXYCTL_APPS_DIR`、`PROXYCTL_DESKTOP_DIRS`、`PROXYCTL_TEST_URL`、`PROXYCTL_IFACE`。
+`PROXYCTL_NO_ESCALATE`、`PROXYCTL_APPS_DIR`、`PROXYCTL_DESKTOP_DIRS`、`PROXYCTL_TEST_URL`、`PROXYCTL_IFACE`、`PROXYCTL_RESOLV_CONF`、`PROXYCTL_RESOLVED_CONF`、`PROXYCTL_RESOLVECTL`。
 如果系统里有 dae，测试还会用真实的 `dae validate` 校验生成的配置（当前用户所有的 0600 文件，非 root 可执行）。
+
+发布新版本：在 `CHANGELOG.md` 顶部写好新版本的段落，把 `proxyctl` 里的 `VERSION` 改成同一版本号，提交后
+`git tag vX.Y.Z && git push origin main vX.Y.Z`。GitHub Actions 会检查版本号一致，并用 CHANGELOG 中的段落自动创建 Release。
 
 ## 许可证
 
