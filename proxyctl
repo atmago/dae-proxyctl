@@ -2188,8 +2188,8 @@ class Checker(object):
         return 2 if "FAIL" in levels else (1 if "WARN" in levels else 0)
 
 
-def listener_process():
-    """用 ss 找出 SOCKS 端口的监听进程；返回描述字符串或 None。"""
+def listener_procs():
+    """用 ss 找出 SOCKS 端口的监听进程：[(名字, pid), ...]；看不到进程信息时为 []，没有监听者时为 None。"""
     host, port = socks_addr()
     rc, out = run_cmd([ss_bin(), "-ltnpH"], timeout=15)
     if rc != 0:
@@ -2201,11 +2201,18 @@ def listener_process():
         local = parts[3]
         _, p = split_addr(local)
         if p == str(port):
-            procs = SS_USERS_RE.findall(" ".join(parts[5:]))
-            if procs:
-                return ", ".join("%s(pid %s)" % (n, pid) for n, pid in procs)
-            return "未知进程（非 root 看不到其他用户的进程）"
+            return SS_USERS_RE.findall(" ".join(parts[5:]))
     return None
+
+
+def listener_process():
+    """SOCKS 端口监听进程的描述字符串，没有监听者时为 None。"""
+    procs = listener_procs()
+    if procs is None:
+        return None
+    if procs:
+        return ", ".join("%s(pid %s)" % (n, pid) for n, pid in procs)
+    return "未知进程（非 root 看不到其他用户的进程）"
 
 
 def default_route_ifaces():
@@ -2300,7 +2307,7 @@ CHAIN_FAIL = ("代理链路不通：dae、SOCKS5 端口和 xray 都在运行，�
               "请在 v2rayN 中测试或更换节点。")
 
 
-def check_chain(ck, use_cache):
+def check_chain(ck, use_cache, core=None):
     """链路探测。use_cache=True（定时器）时，最近一次探测成功、不慢且未超过间隔就不重复探测。
     连续 2 次失败才判 FAIL，避免节点偶发抖动误报；FAIL 文案固定，保证通知去重有效。
     连续 SLOW_STREAK 次成功但耗时超过 slow_seconds() 时给出“很慢”警告（ck.slow），
@@ -2322,6 +2329,7 @@ def check_chain(ck, use_cache):
                        "detail": detail}, f, ensure_ascii=False)
     except OSError:
         pass
+    record_chain_sample(now, ok, elapsed, core)
     if not ok:
         if fails >= 2:
             ck.add("FAIL", CHAIN_FAIL)
@@ -2338,6 +2346,213 @@ def check_chain(ck, use_cache):
         ck.add("OK", "代理链路正常：经 SOCKS5 访问 %s 成功（%s）。" % (probe_url(), detail))
 
 
+# ---- 链路延迟记录 ----------------------------------------------------------------
+# 每次真正发出的链路探测（定时器正常时约 2 分钟一次，异常时 15 秒一次）追加一行 JSON：
+# {"t": 时间戳, "ok": 1/0, "s": 耗时秒数, "core": SOCKS 监听进程名}。保存在用户目录，重启后仍在。
+HISTORY_DAYS = 7
+HISTORY_GAP = 600  # 两次记录相隔超过这么多秒视为中断（休眠、关机或定时器没运行），曲线在此断开
+
+
+def history_path():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return _env("PROXYCTL_HISTORY", os.path.join(base, "proxyctl", "chain-history.jsonl"))
+
+
+def record_chain_sample(now, ok, elapsed, core):
+    """追加一条探测记录；以 root 运行（sudo proxyctl check）时不记录，免得写进 root 的主目录。
+    文件超过 256 KB 且最早一条已超过保留期时，重写一次，只保留最近 HISTORY_DAYS 天。"""
+    if os.geteuid() == 0:
+        return
+    path = history_path()
+    line = json.dumps({"t": int(now), "ok": 1 if ok else 0, "s": round(elapsed, 2), "core": core or ""},
+                      ensure_ascii=False) + "\n"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(line)
+        if os.path.getsize(path) > 256 * 1024:
+            cutoff = now - HISTORY_DAYS * 86400
+            with open(path) as f:
+                first = _history_record(f.readline())
+            if first and first["t"] < cutoff - 3600:
+                keep = [r for r in load_history(cutoff, path)]
+                fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".history.")
+                with os.fdopen(fd, "w") as f:
+                    for r in keep:
+                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _history_record(line):
+    try:
+        r = json.loads(line)
+        if isinstance(r, dict) and isinstance(r.get("t"), (int, float)):
+            return {"t": int(r["t"]), "ok": 1 if r.get("ok") else 0,
+                    "s": float(r.get("s") or 0), "core": str(r.get("core") or "")}
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def load_history(since=0, path=None):
+    """读取 since 之后的记录（按时间排序），坏行忽略。"""
+    out = []
+    try:
+        with open(path or history_path(), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                r = _history_record(line)
+                if r and r["t"] >= since:
+                    out.append(r)
+    except OSError:
+        pass
+    out.sort(key=lambda r: r["t"])
+    return out
+
+
+def _quantile(values, q):
+    v = sorted(values)
+    if not v:
+        return None
+    return v[min(len(v) - 1, int(round(q * (len(v) - 1))))]
+
+
+def history_stats(recs, slow=None):
+    """汇总：次数、失败、成功探测耗时的中位数 / 90 分位 / 最大值、偏慢次数。"""
+    slow = slow_seconds() if slow is None else slow
+    times = [r["s"] for r in recs if r["ok"]]
+    return {"count": len(recs), "fails": len(recs) - len(times),
+            "median": _quantile(times, 0.5), "p90": _quantile(times, 0.9),
+            "max": max(times) if times else None, "slow": sum(1 for t in times if t > slow)}
+
+
+def history_episodes(recs, slow=None, gap=HISTORY_GAP):
+    """把连续的异常探测（失败或偏慢）合并成时段；只有 1 次的偶发抖动不算。
+    返回 [{"start", "end", "fails", "slow", "median", "max", "cores"}]，按时间排序。"""
+    slow = slow_seconds() if slow is None else slow
+    episodes, cur, last_t = [], None, None
+    for r in recs:
+        bad = not r["ok"] or r["s"] > slow
+        if cur is not None and (not bad or r["t"] - last_t > gap):
+            episodes.append(cur)
+            cur = None
+        if bad:
+            if cur is None:
+                cur = {"start": r["t"], "recs": []}
+            cur["end"] = r["t"]
+            cur["recs"].append(r)
+        last_t = r["t"]
+    if cur is not None:
+        episodes.append(cur)
+    out = []
+    for e in episodes:
+        if len(e["recs"]) < 2:
+            continue
+        st = history_stats(e["recs"], slow)
+        out.append({"start": e["start"], "end": e["end"], "fails": st["fails"], "slow": st["slow"],
+                    "median": st["median"], "max": st["max"],
+                    "cores": sorted({r["core"] for r in e["recs"] if r["core"]})})
+    return out
+
+
+def history_core_switches(recs):
+    """内核切换：[(时间, 原内核, 新内核)]。没有记录内核的探测跳过。"""
+    out, prev = [], None
+    for r in recs:
+        if not r["core"]:
+            continue
+        if prev is not None and r["core"] != prev:
+            out.append((r["t"], prev, r["core"]))
+        prev = r["core"]
+    return out
+
+
+def history_buckets(recs, start, end, step):
+    """按 step 秒分段统计，只返回有记录的时段：[(段起点, stats, 内核列表)]。"""
+    groups = {}
+    for r in recs:
+        if start <= r["t"] < end:
+            groups.setdefault(start + (r["t"] - start) // step * step, []).append(r)
+    return [(k, history_stats(v), sorted({r["core"] for r in v if r["core"]})) for k, v in sorted(groups.items())]
+
+
+def fmt_secs(v):
+    return "—" if v is None else "%.1f 秒" % v
+
+
+def fmt_clock(t, with_date=True):
+    return datetime.datetime.fromtimestamp(t).strftime("%m-%d %H:%M" if with_date else "%H:%M")
+
+
+def fmt_span(start, end):
+    a = fmt_clock(start)
+    if end - start < 60:
+        return a
+    b = fmt_clock(end, datetime.date.fromtimestamp(start) != datetime.date.fromtimestamp(end))
+    return "%s–%s" % (a, b)
+
+
+def describe_episode(e, slow=None):
+    slow = slow_seconds() if slow is None else slow
+    parts = []
+    if e["fails"]:
+        parts.append("失败 %d 次" % e["fails"])
+    if e["slow"]:
+        parts.append("%d 次超过 %g 秒（中位 %s，最慢 %s）" % (e["slow"], slow, fmt_secs(e["median"]),
+                                                     fmt_secs(e["max"])))
+    kind = "不通" if e["fails"] and not e["slow"] else ("很慢" if not e["fails"] else "不稳定")
+    return kind, "，".join(parts) + ("；内核 %s" % "、".join(e["cores"]) if e["cores"] else "")
+
+
+def history_summary_line(st):
+    if not st["count"]:
+        return "没有记录。"
+    s = "共 %d 次探测" % st["count"]
+    if st["median"] is not None:
+        s += "：中位 %s，90%% 在 %s 以内，最慢 %s" % (fmt_secs(st["median"]), fmt_secs(st["p90"]), fmt_secs(st["max"]))
+    return s + "；偏慢（超过 %g 秒）%d 次，失败 %d 次。" % (slow_seconds(), st["slow"], st["fails"])
+
+
+def cmd_history(args):
+    hours = max(1, min(args.hours, HISTORY_DAYS * 24))
+    now = time.time()
+    recs = load_history(now - hours * 3600)
+    print("代理链路延迟记录（最近 %d 小时）" % hours)
+    print("每条记录是健康检查定时器经 SOCKS5 新建一条连接访问外网的耗时：正常时约 2 分钟一次，异常时每 15 秒一次。")
+    if not recs:
+        print()
+        print("没有记录（%s）。记录由定时器写入，请确认它在运行：" % history_path())
+        print("  systemctl --user enable --now proxyctl-check.timer")
+        return 0
+    st = history_stats(recs)
+    print(history_summary_line(st))
+    last = recs[-1]
+    if last["core"]:
+        sw = history_core_switches(recs)
+        print("当前内核：%s%s" % (last["core"], "（%s 从 %s 切换）" % (fmt_clock(sw[-1][0]), sw[-1][1]) if sw else ""))
+    print()
+    step = 3600 if hours <= 48 else 6 * 3600
+    off = int(datetime.datetime.now().astimezone().utcoffset().total_seconds())  # 按本地整点分段
+    start = (int(now - hours * 3600) + off) // step * step - off
+    rows = []
+    for k, b, cores in history_buckets(recs, start, now + 1, step):
+        bar = "█" * min(20, int(round((b["median"] or 0) / 0.25))) if b["median"] is not None else ""
+        rows.append([fmt_clock(k), str(b["count"]), fmt_secs(b["median"]), fmt_secs(b["max"]),
+                     str(b["fails"]) if b["fails"] else "", "、".join(cores), bar])
+    print(table(["时段", "次数", "中位", "最慢", "失败", "内核", "中位耗时（每格 0.25 秒）"], rows))
+    eps = history_episodes(recs)
+    sws = history_core_switches(recs)
+    if eps or sws:
+        print()
+    for e in eps:
+        kind, desc = describe_episode(e)
+        print("%s %s  %s：%s" % (color("!", "33"), fmt_span(e["start"], e["end"]), kind, desc))
+    for t, a, b in sws:
+        print("· %s  内核切换：%s → %s" % (fmt_clock(t), a, b))
+    return 0
+
+
 def check_basic(ck, chain_cache=False):
     state = service_state()
     if state == "active":
@@ -2346,9 +2561,11 @@ def check_basic(ck, chain_cache=False):
         ck.add("FAIL", "dae 服务未运行（状态：%s）！代理名单里的程序此刻会直接连接外网（故障即放行）。"
                        "请执行：sudo systemctl start dae" % state)
     listening = socks_listening()
+    who = []
     if listening:
-        who = listener_process()
-        ck.add("OK", "SOCKS5 %s 正在监听%s。" % (socks_str(), ("，监听进程：" + who) if who else ""))
+        who = listener_procs() or []
+        desc = ", ".join("%s(pid %s)" % w for w in who) if who else listener_process()
+        ck.add("OK", "SOCKS5 %s 正在监听%s。" % (socks_str(), ("，监听进程：" + desc) if desc else ""))
     else:
         ck.add("FAIL", "SOCKS5 %s 没有在监听！名单中的程序将无法联网（故障即断开）。请检查 v2rayN / xray。"
                % socks_str())
@@ -2362,7 +2579,9 @@ def check_basic(ck, chain_cache=False):
     else:
         ck.add("FAIL", "没有找到 xray / sing-box / mihomo 进程（代理核心未运行）。")
     if state == "active" and listening:
-        check_chain(ck, chain_cache)
+        # 记录是哪个内核在提供 SOCKS：监听进程最准确，看不到时退回正在运行的代理核心
+        names = sorted({n for n, _ in who}) or [n for n in CORE_NAMES if n in procs]
+        check_chain(ck, chain_cache, "+".join(names) or None)
     else:
         # dae 或端口已经报了 FAIL，链路探测没有意义；清掉旧状态，恢复后重新计数
         try:
@@ -3069,6 +3288,21 @@ def gui_row_actions(name, status, view):
 GUI_COLORS_ADW = {"$OK": "@success_color", "$WARN": "@warning_color", "$BAD": "@error_color",
                   "$ACCENT": "@accent_color"}
 GUI_COLORS_PLAIN = {"$OK": "#2ec27e", "$WARN": "#e5a50a", "$BAD": "#e01b24", "$ACCENT": "#3584e4"}
+# 延迟曲线：系列色按深浅色分别取值，失败标记用固定的“严重”状态色
+CHART_SERIES_LIGHT = "#2a78d6"
+CHART_SERIES_DARK = "#3987e5"
+CHART_CRITICAL = "#d03b3b"
+# 每个代理内核一个固定颜色（浅色, 深色），颜色跟着内核走，不随出现顺序变化。
+# 名字按包含关系匹配，例如 Clash Verge 的 verge-mihomo 也算 mihomo。三色已用 dataviz 校验器验证色盲可分。
+CORE_COLORS = (("sing-box", "#1baf7a", "#199e70"), ("xray", "#eb6834", "#d95926"), ("mihomo", "#4a3aa7", "#9085e9"))
+
+
+def core_color(name, dark):
+    """内核的标识色；不认识的内核返回 None（用中性灰）。"""
+    for key, light, dk in CORE_COLORS:
+        if key in (name or ""):
+            return dk if dark else light
+    return None
 # Pango 标记里的小圆点（不能用 CSS 命名色）
 GUI_DOT = {"ok": "#2ec27e", "warn": "#e5a50a", "bad": "#e01b24", "unknown": "#9a9996"}
 
@@ -3093,6 +3327,8 @@ GUI_CSS = """
 .tag-direct { color: $ACCENT; background-color: alpha($ACCENT, 0.14); }
 .tag-child { color: $WARN; background-color: alpha($WARN, 0.16); }
 .tag-default { background-color: alpha(currentColor, 0.08); }
+.tag-bad { color: $BAD; background-color: alpha($BAD, 0.14); }
+.chart-card { border-radius: 12px; border: 1px solid alpha(currentColor, 0.12); padding: 6px 4px 2px 0; }
 .tag-dns-ok { color: $OK; border: 1px solid alpha($OK, 0.45); }
 .warn-text { color: $WARN; }
 .ok-text { color: $OK; }
@@ -3130,6 +3366,10 @@ class ProxyctlGui(object):
         self.procs_running = {}
         self.alert = False
         self.chooser = None
+        self.chain_sig = None
+        self.chain_hours = 24
+        self.chain_recs = []
+        self.chain_hover = None  # 鼠标所在的横坐标（像素），用于画十字线
 
     # -- GTK3/GTK4 兼容辅助 ------------------------------------------------------
     def put(self, container, child):
@@ -3395,15 +3635,18 @@ class ProxyctlGui(object):
         self.content = self.stack
         self.put(body, self.stack)
         procs, rules, dns = self.build_procs_page(), self.build_rules_page(), self.build_dns_page()
+        chain = self.build_chain_page()
         if Adw:
             self.stack.add_titled_with_icon(procs, "procs", "联网进程", "network-transmit-receive-symbolic")
             self.stack.add_titled_with_icon(rules, "rules", "规则", "view-list-bullet-symbolic")
             self.stack.add_titled_with_icon(dns, "dns", "DNS", "network-server-symbolic")
+            self.stack.add_titled_with_icon(chain, "chain", "延迟", "power-profile-performance-symbolic")
         else:
             self.stack.add_titled(procs, "procs", "联网进程")
             self.stack.add_titled(rules, "rules", "规则")
             self.stack.add_titled(dns, "dns", "DNS")
-        self.stack.connect("notify::visible-child", lambda *_: self.refresh_dns(self.view))
+            self.stack.add_titled(chain, "chain", "延迟")
+        self.stack.connect("notify::visible-child", lambda *_: (self.refresh_dns(self.view), self.refresh_chain()))
 
         if Adw:
             self.toasts = Adw.ToastOverlay()
@@ -3489,6 +3732,362 @@ class ProxyctlGui(object):
         self.put(page, self.scrolled(self.margins(self.clamp(self.dns_box), 0, 16, 20)))
         return page
 
+    def build_chain_page(self):
+        """延迟页：定时器记录的链路探测耗时曲线＋异常时段和内核切换。"""
+        Gtk = self.Gtk
+        page = self.box(vertical=True, spacing=0)
+        inner = self.box(vertical=True, spacing=0)
+        top = self.box(spacing=12)
+        top.set_margin_top(14)
+        self.chain_summary = self.put(top, self.label(wrap=True, classes=("caption",)))
+        self.chain_summary.set_hexpand(True)
+        seg = self.css(self.box(spacing=0), "linked")
+        seg.set_valign(Gtk.Align.CENTER)
+        self.chain_toggles = {}
+        for hours, text in ((6, "6 小时"), (24, "24 小时"), (HISTORY_DAYS * 24, "%d 天" % HISTORY_DAYS)):
+            b = Gtk.ToggleButton(label=text)
+            b.set_active(hours == self.chain_hours)
+            b.connect("toggled", self.on_chain_range, hours)
+            self.chain_toggles[hours] = self.put(seg, b)
+        self.put(top, seg)
+        self.put(inner, top)
+        area = self.make_chain_chart()
+        self.chain_area = area
+        card = self.css(self.box(vertical=True, spacing=0), "chart-card")
+        card.set_margin_top(10)
+        self.put(card, area)
+        self.put(inner, card)
+        legend = self.label("", wrap=True, classes=("caption",), markup=True)
+        legend.set_margin_top(6)
+        legend.set_margin_start(4)
+        self.chain_legend = self.put(inner, legend)
+        self.chain_box = self.put(inner, self.box(vertical=True, spacing=0))
+        self.put(page, self.scrolled(self.margins(self.clamp(inner), 0, 16, 20)))
+        return page
+
+    def on_chain_range(self, btn, hours):
+        if getattr(self, "_chain_toggling", False):
+            return
+        self._chain_toggling = True
+        try:
+            if not btn.get_active():  # 不允许全部取消：再点一次当前选项保持选中
+                btn.set_active(True)
+            else:
+                self.chain_hours = hours
+                for h, b in self.chain_toggles.items():
+                    b.set_active(h == hours)
+                self.chain_sig = None
+                self.refresh_chain()
+        finally:
+            self._chain_toggling = False
+
+    def refresh_chain(self):
+        """只在延迟页可见时读取记录；记录文件没有变化且时间没过 1 分钟时不重绘。"""
+        if self.stack.get_visible_child_name() != "chain":
+            return
+        path = history_path()
+        try:
+            st = os.stat(path)
+            fsig = (st.st_mtime, st.st_size)
+        except OSError:
+            fsig = None
+        now = time.time()
+        sig = (fsig, self.chain_hours, int(now // 60))
+        if sig == self.chain_sig:
+            return
+        self.chain_sig = sig
+        self.chain_now = now
+        recs = load_history(now - self.chain_hours * 3600)
+        self.chain_recs = recs
+        stats = history_stats(recs)
+        esc = self.GLib.markup_escape_text
+        if recs:
+            text = esc(history_summary_line(stats), -1)
+            if recs[-1]["core"]:
+                text += "当前内核：%s" % "、".join(self.core_pill(n) for n in recs[-1]["core"].split("+"))
+        else:
+            text = esc("还没有记录。健康检查定时器运行后，每 2 分钟会记录一次（%s）。" % history_path(), -1)
+        self.chain_summary.set_markup(text)
+        slow = slow_seconds()
+        dot = '<span foreground="%s">%s</span>'
+        self.chain_legend.set_markup(
+            "%s 新建代理连接的耗时　%s 失败　%s 偏慢线（%g 秒）　底部色带是当时的内核（每个内核一种颜色），"
+            "曲线断开处没有记录（休眠、关机或定时器没运行）"
+            % (dot % (self.chain_color()[0], "━"), dot % (CHART_CRITICAL, "✕"), "┄", slow))
+        self.chain_area.queue_draw()
+
+        box = self.chain_box
+        self.clear(box)
+        eps = history_episodes(recs, slow)
+        sws = history_core_switches(recs)
+        items = [(e["start"], "ep", e) for e in eps] + [(t, "sw", (a, b)) for t, a, b in sws]
+        lb = self.group(box, "异常时段与内核切换", len(items) or None,
+                        "连续 2 次以上失败或超过 %g 秒才算异常时段；只有 1 次的偶发抖动不列出。" % slow)
+        if not items:
+            self.row(lb, "没有异常", "这段时间里链路一直正常，也没有切换内核。", dim=True)
+        for t, kind, v in sorted(items, key=lambda x: -x[0])[:40]:
+            if kind == "ep":
+                name, desc = describe_episode(v, slow)
+                tag = ("不通", "tag-bad") if name == "不通" else (name, "tag-child")
+                self.row(lb, fmt_span(v["start"], v["end"]), desc, tag=tag, wrap=True)
+            else:
+                self.row(lb, fmt_clock(t), "内核切换：%s → %s" % tuple(self.core_pill(n) for n in v),
+                         tag=("切换", "tag-default"), sub_markup=True)
+        if self.ver == 3:
+            box.show_all()
+
+    def core_pill(self, name):
+        """内核名做成带底色的粗体小标签（Pango 标记）：文字保持正文色，底色是内核的标识色。"""
+        dark = self.chain_color()[2] if hasattr(self, "chain_area") else False
+        esc = self.GLib.markup_escape_text(name, -1)
+        c = core_color(name, dark)
+        if not c:
+            return "<b>%s</b>" % esc
+        return '<span background="%s" bgalpha="%d%%" weight="bold"> %s </span>' % (c, 45 if dark else 28, esc)
+
+    # -- 延迟曲线 ------------------------------------------------------------------
+    def chain_color(self):
+        """（系列颜色, 前景 RGBA, 是否深色）。前景色取自控件，深浅色跟随主题。"""
+        w = self.chain_area
+        try:
+            fg = w.get_color() if self.ver == 4 else w.get_style_context().get_color(self.Gtk.StateFlags.NORMAL)
+        except AttributeError:
+            fg = w.get_style_context().get_color()
+        dark = (0.2126 * fg.red + 0.7152 * fg.green + 0.0722 * fg.blue) > 0.5
+        return (CHART_SERIES_DARK if dark else CHART_SERIES_LIGHT), fg, dark
+
+    def chain_geometry(self, w, h):
+        """绘图区：左侧留给纵轴刻度，底部依次是内核色带和时间刻度。"""
+        return 52, 14, w - 16, h - 44  # x0, y0, x1, y1（曲线区域）
+
+    def chain_x(self, t, x0, x1):
+        t1 = self.chain_now
+        t0 = t1 - self.chain_hours * 3600
+        return x0 + (t - t0) / (t1 - t0) * (x1 - x0)
+
+    def chain_nearest(self, x, w):
+        x0, _, x1, _ = self.chain_geometry(w, 0)
+        if not self.chain_recs or x is None or x < x0 - 6 or x > x1 + 6:
+            return None
+        best = min(self.chain_recs, key=lambda r: abs(self.chain_x(r["t"], x0, x1) - x))
+        return best if abs(self.chain_x(best["t"], x0, x1) - x) <= 12 else None
+
+    def on_chain_motion(self, x):
+        self.chain_hover = x
+        self.chain_area.queue_draw()
+
+    def on_chain_tooltip(self, area, x, y, keyboard, tooltip):
+        w = area.get_width() if self.ver == 4 else area.get_allocated_width()
+        r = self.chain_nearest(x, w)
+        if r is None:
+            return False
+        text = "%s　%s" % (fmt_clock(r["t"]), "%.2f 秒" % r["s"] if r["ok"] else "失败（连不上外网）")
+        if r["core"]:
+            text += "　%s" % r["core"]
+        tooltip.set_text(text)
+        return True
+
+    def chart_supported(self):
+        """曲线用 GTK4 的 GSK 路径绘制（GTK 4.14 起提供），不依赖 python3-gi-cairo。"""
+        if self.ver != 4 or self.Gtk.get_minor_version() < 14:
+            return False
+        try:
+            from gi.repository import Gsk, Graphene  # noqa: F401
+            return hasattr(Gsk, "PathBuilder")
+        except ImportError:
+            return False
+
+    def make_chain_chart(self):
+        Gtk = self.Gtk
+        if not self.chart_supported():
+            lb = self.label("当前 GTK 版本画不了曲线（需要 GTK 4.14 以上）。下面的异常列表不受影响，"
+                            "也可以在终端执行 proxyctl history 查看每小时的统计。", wrap=True, classes=("caption",))
+            return self.margins(lb, 16)
+        gui = self
+
+        class ChainChart(Gtk.Widget):
+            __gtype_name__ = "ProxyctlChainChart"
+
+            def do_snapshot(self, snap):
+                gui.draw_chain(self, snap, self.get_width(), self.get_height())
+
+            def do_measure(self, orientation, for_size):
+                return (0, 0, -1, -1) if orientation == Gtk.Orientation.HORIZONTAL else (250, 250, -1, -1)
+
+        area = ChainChart()
+        area.set_hexpand(True)
+        area.set_has_tooltip(True)
+        area.connect("query-tooltip", self.on_chain_tooltip)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", lambda _c, x, y: self.on_chain_motion(x))
+        motion.connect("leave", lambda _c: self.on_chain_motion(None))
+        area.add_controller(motion)
+        return area
+
+    def draw_chain(self, area, snap, w, h):
+        from gi.repository import Gsk, Graphene
+        Gdk = self.Gdk
+        series, fg, dark = self.chain_color()
+
+        def rgba(spec, a=1.0):
+            c = Gdk.RGBA()
+            if isinstance(spec, str):
+                c.parse(spec)
+            else:
+                c.red, c.green, c.blue = spec
+            c.alpha = a
+            return c
+        ink = (fg.red, fg.green, fg.blue)
+
+        def pt(x, y):
+            return Graphene.Point().init(x, y)
+
+        def rect(x, y, rw, rh, color):
+            snap.append_color(color, Graphene.Rect().init(x, y, rw, rh))
+
+        def stroke(points_list, color, width=1.0, dash=None):
+            b = Gsk.PathBuilder.new()
+            for pts in points_list:
+                b.move_to(*pts[0])
+                for q in pts[1:]:
+                    b.line_to(*q)
+            st = Gsk.Stroke.new(width)
+            st.set_line_join(Gsk.LineJoin.ROUND)
+            st.set_line_cap(Gsk.LineCap.ROUND)
+            if dash:
+                st.set_dash(dash)
+            snap.append_stroke(b.to_path(), st, color)
+
+        def dots(centers, r, color):
+            if not centers:
+                return
+            b = Gsk.PathBuilder.new()
+            for x, y in centers:
+                b.add_circle(pt(x, y), r)
+            snap.append_fill(b.to_path(), Gsk.FillRule.WINDING, color)
+
+        def layout(s, small=True, bold=False):
+            lay = area.create_pango_layout(None)
+            esc = self.GLib.markup_escape_text(s, -1)
+            if bold:
+                esc = "<b>%s</b>" % esc
+            lay.set_markup("<small>%s</small>" % esc if small else esc, -1)
+            return lay
+
+        def text(s, x, y, align=0.0, alpha=0.62, small=True, bold=False):
+            lay = layout(s, small, bold)
+            tw, th = lay.get_pixel_size()
+            snap.save()
+            snap.translate(pt(round(x - tw * align), round(y - th / 2)))
+            snap.append_layout(lay, rgba(ink, alpha))
+            snap.restore()
+
+        x0, y0, x1, y1 = self.chain_geometry(w, h)
+        recs = self.chain_recs
+        if not hasattr(self, "chain_now"):
+            self.chain_now = time.time()
+        if not recs:
+            text("还没有记录", w / 2, h / 2, align=0.5, small=False)
+            return
+        slow = slow_seconds()
+        oks = [r["s"] for r in recs if r["ok"]]
+        top = min(max(oks + [0.5]), 15)
+        ymax = next(v for v in (0.5, 1, 2, 3, 4, 5, 6, 8, 10, 15, 20) if v >= top * 1.1 or v == 20)
+        step = 0.25 if ymax <= 1 else 0.5 if ymax <= 2 else 1 if ymax <= 6 else 2 if ymax <= 10 else 5
+
+        def ypos(v):
+            return y1 - min(v, ymax) / ymax * (y1 - y0)
+
+        # 网格与纵轴刻度（淡）
+        v = 0.0
+        while v <= ymax + 1e-9:
+            y = round(ypos(v))
+            rect(x0, y, x1 - x0, 1, rgba(ink, 0.16 if v == 0 else 0.07))
+            text(("%g 秒" % v) if v else "0", x0 - 8, y, align=1.0)
+            v += step
+
+        # 时间刻度：按本地时间对齐
+        now = self.chain_now
+        t0 = now - self.chain_hours * 3600
+        tick = 3600 if self.chain_hours <= 6 else 3 * 3600 if self.chain_hours <= 24 else 86400
+        off = int(datetime.datetime.now().astimezone().utcoffset().total_seconds())
+        t = (int(t0) + off) // tick * tick - off + tick
+        while t < now:
+            x = round(self.chain_x(t, x0, x1))
+            rect(x, y0, 1, y1 - y0, rgba(ink, 0.07))
+            lab = datetime.datetime.fromtimestamp(t).strftime("%m-%d" if tick == 86400 else "%H:%M")
+            text(lab, x, h - 10, align=0.5)
+            t += tick
+
+        # 偏慢线
+        if slow <= ymax:
+            y = round(ypos(slow)) + 0.5
+            stroke([[(x0, y), (x1, y)]], rgba(ink, 0.45), 1, [4, 4])
+            text("偏慢 %g 秒" % slow, x1 - 4, y - 9, align=1.0, alpha=0.7)
+
+        # 内核色带：同一内核连续的一段画成一块，块内写内核名
+        order = []
+        for r in recs:
+            if r["core"] and r["core"] not in order:
+                order.append(r["core"])
+        segs, cur = [], None
+        for r in recs:
+            if cur and (r["core"] != cur[0] or r["t"] - cur[2] > HISTORY_GAP):
+                segs.append(cur)
+                cur = None
+            if cur is None:
+                cur = [r["core"], r["t"], r["t"]]
+            cur[2] = r["t"]
+        if cur:
+            segs.append(cur)
+        sy, sh = y1 + 5, 14
+        for core, a, b in segs:
+            if not core:
+                continue
+            xa = self.chain_x(a, x0, x1)
+            xb = min(max(self.chain_x(b, x0, x1), xa + 6), x1)  # 只有一两个点时也至少 6 像素宽，看得见
+            xa = min(xa, xb - 6)
+            c = core_color(core, dark)
+            rect(xa, sy, xb - xa, sh, rgba(c, 0.55 if dark else 0.40) if c else
+                 rgba(ink, 0.10 if order.index(core) % 2 == 0 else 0.22))
+            if layout(core, bold=True).get_pixel_size()[0] + 8 < xb - xa:
+                text(core, (xa + xb) / 2, sy + sh / 2, align=0.5, alpha=0.95, bold=True)
+
+        # 曲线：失败和长时间没有记录处断开；超出纵轴上限的点压在顶部
+        runs, run, last = [], [], None
+        for r in recs:
+            if not r["ok"] or (last is not None and r["t"] - last > HISTORY_GAP):
+                if run:
+                    runs.append(run)
+                run = []
+            if r["ok"]:
+                run.append((self.chain_x(r["t"], x0, x1), ypos(r["s"])))
+            last = r["t"]
+        if run:
+            runs.append(run)
+        color = rgba(series)
+        lines = [p for p in runs if len(p) > 1]
+        if lines:
+            stroke(lines, color, 2 if self.chain_hours <= 24 else 1.5)
+        dots([p[0] for p in runs if len(p) == 1], 2.5, color)
+        # 失败：顶部的红色 ✕
+        crosses = []
+        for r in recs:
+            if not r["ok"]:
+                x, y = self.chain_x(r["t"], x0, x1), y0 + 5
+                crosses += [[(x - 4, y - 4), (x + 4, y + 4)], [(x + 4, y - 4), (x - 4, y + 4)]]
+        if crosses:
+            stroke(crosses, rgba(CHART_CRITICAL), 2)
+
+        # 悬停：竖线＋该点的圆点（外圈用背景色把点和曲线隔开）
+        hit = self.chain_nearest(self.chain_hover, w)
+        if hit is not None:
+            x = self.chain_x(hit["t"], x0, x1)
+            rect(round(x), y0, 1, y1 - y0, rgba(ink, 0.35))
+            y = ypos(hit["s"]) if hit["ok"] else y0 + 5
+            dots([(x, y)], 6, rgba((0.14, 0.14, 0.14) if dark else (1.0, 1.0, 1.0)))
+            dots([(x, y)], 4.5, rgba(series) if hit["ok"] else rgba(CHART_CRITICAL))
+
     def focus_search(self):
         self.stack.set_visible_child_name("procs")
         self.search.grab_focus()
@@ -3502,6 +4101,7 @@ class ProxyctlGui(object):
             self.refresh_procs(view)
             self.refresh_rules(view, note)
             self.refresh_dns(view)
+            self.refresh_chain()
             if not self.busy and self.status.get_text().startswith("刷新失败"):
                 self.set_status("")
         except Exception as e:  # noqa  GUI 不能因为一次刷新失败而退出
@@ -3509,7 +4109,7 @@ class ProxyctlGui(object):
         return True
 
     def force_refresh(self):
-        self.proc_sig = self.rules_sig = self.hero_sig = self.dns_sig = None
+        self.proc_sig = self.rules_sig = self.hero_sig = self.dns_sig = self.chain_sig = None
         self.resolver_cache = (0.0, None)
         self.refresh()
 
@@ -3555,15 +4155,18 @@ class ProxyctlGui(object):
         state = service_state()
         listening = socks_listening(0.5)
         cores = [n for n in CORE_NAMES if n in running_processes()]
+        # 显示正在监听 SOCKS 端口的内核（两个内核同时运行时，只有它在干活）；看不到时退回正在运行的内核
+        shown = (sorted({n for n, _ in (listener_procs() or [])}) if listening else []) or cores
         chain_level, chain_text = self.chain_state()
         esc = self.GLib.markup_escape_text
         facts = [
             ("ok" if state == "active" else "bad", "dae %s" % SERVICE_STATE_ZH.get(state, state)),
             ("ok" if listening else "bad", "SOCKS %s %s" % (socks_str(), "监听中" if listening else "未监听")),
-            ("ok" if cores else "bad", "、".join(cores) if cores else "代理核心未运行"),
+            ("ok" if shown else "bad", "、".join(self.core_pill(n) for n in shown) if shown else "代理核心未运行"),
             (chain_level, chain_text.replace("：", " ", 1)),
         ]
-        markup = "　".join('<span foreground="%s">●</span> %s' % (GUI_DOT[lv], esc(t, -1)) for lv, t in facts)
+        markup = "　".join('<span foreground="%s">●</span> %s' % (GUI_DOT[lv], t if i == 2 else esc(t, -1))
+                          for i, (lv, t) in enumerate(facts))
 
         if state != "active":
             level, title, hint = ("bad", "dae 未运行，名单中的程序正在直连",
@@ -4100,6 +4703,8 @@ def build_parser():
     sp.add_argument("file", help="proxyctl export 生成的 JSON 文件")
     sp.add_argument("--replace", action="store_true",
                     help="用文件内容替换现有规则（默认是合并：只新增，不删除）")
+    sp = sub.add_parser("history", help="代理链路延迟记录：每小时的中位 / 最慢耗时、失败、异常时段和内核切换")
+    sp.add_argument("--hours", type=int, default=24, metavar="N", help="查看最近 N 小时（默认 24，最多 168）")
     sub.add_parser("backups", help="列出配置备份")
     sp = sub.add_parser("restore", help="恢复备份（需要 root）")
     sp.add_argument("backup", help="备份名")
@@ -4112,7 +4717,7 @@ HANDLERS = {
     "unprotect": cmd_unprotect, "rules": cmd_rules, "list": cmd_list, "pick": cmd_pick,
     "check": cmd_check, "test": cmd_test, "run": cmd_run, "guard-desktop": cmd_guard_desktop,
     "backups": cmd_backups, "restore": cmd_restore, "gui": cmd_gui,
-    "export": cmd_export, "import": cmd_import, "dns": cmd_dns,
+    "export": cmd_export, "import": cmd_import, "dns": cmd_dns, "history": cmd_history,
 }
 WRITE_CMDS = {"init", "add", "remove", "protect", "unprotect", "restore", "import"}
 

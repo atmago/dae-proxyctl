@@ -76,6 +76,7 @@ class FakeEnv(unittest.TestCase):
             "FAKE_SS_SAMPLE": os.path.join(FIXTURES, "ss_sample.txt"),
             "FAKE_SS_LISTEN": os.path.join(FIXTURES, "ss_listen.txt"),
             "XDG_RUNTIME_DIR": self.tmp,
+            "PROXYCTL_HISTORY": os.path.join(self.tmp, "chain-history.jsonl"),
             "NO_COLOR": "1",
         })
 

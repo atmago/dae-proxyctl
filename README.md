@@ -423,6 +423,8 @@ sudo systemctl enable dae
 * **顶部状态卡**：一句话告诉你代理是否正常，出问题时变色并给出处理建议；
 * **联网进程页**：按“需要注意 / 代理中 / 直连 / 最近断开”分组，一键加入代理、直连保护或移除，`Ctrl` + `F` 搜索；
 * **规则页**：查看和管理代理名单、直连保护名单，也可以手动输入进程名添加；
+* **延迟页**：过去 6 小时 / 24 小时 / 7 天里每次新建代理连接的耗时曲线，底部色带标出当时用的是哪个内核，
+  下方列出异常时段（连续失败或超过 3 秒）和内核切换，鼠标悬停可看每个点的时间和耗时；
 * **右上角**：运行自检。
 
 常用命令：
@@ -434,6 +436,7 @@ sudo systemctl enable dae
 | 把程序移出代理 | `proxyctl remove <进程名>` |
 | 查看当前名单 | `proxyctl rules` |
 | 代理好像不通了 | `proxyctl test`，然后 `sudo proxyctl check` |
+| 最近是不是节点变慢了、从什么时候开始的 | `proxyctl history`（GUI：延迟页） |
 | 改坏了想恢复 | `sudo proxyctl backups`，然后 `sudo proxyctl restore <备份名>` |
 | 想知道代理程序的 DNS 怎么走 | `proxyctl dns`（GUI：DNS 页） |
 | 不想让运营商看到代理程序查询的域名 | `sudo proxyctl dns --protect on`（GUI：DNS 页 → DNS 防泄漏 → 开启） |
@@ -627,6 +630,7 @@ socks = 127.0.0.1:7891
 | `proxyctl dns --protect on\|off` | DNS 防泄漏开关（需要 root，见“DNS 会泄露吗？”）。 |
 | `proxyctl export [文件]` | 把代理名单和直连保护名单导出为 JSON（省略文件名时输出到终端）。只含进程名，不含节点、订阅等信息，可以放心拷到另一台机器或分享给别人。不需要 root。 |
 | `proxyctl import <文件> [--replace]` | 导入 `export` 生成的文件。默认**合并**：只新增，不删除现有条目；加 `--replace` 则让规则与文件完全一致。文件中任何一个名字不合法就整体拒绝；通用运行时名称（如 curl、python3）、安全区块中的名字、与现有规则冲突的名字（合并时）会被跳过并说明原因。同样经过备份 / validate / reload / 回滚流程。 |
+| `proxyctl history [--hours N]` | 代理链路延迟记录：最近 N 小时（默认 24，最多 168）的探测次数、中位 / 90 分位 / 最慢耗时、每小时统计、异常时段和内核切换。数据由健康检查定时器写入 `~/.local/state/proxyctl/chain-history.jsonl`，保留 7 天。GUI 中是“延迟”页。不需要 root。 |
 | `proxyctl backups` | 列出配置备份。 |
 | `proxyctl restore <备份名>` | 恢复备份（同样经过 validate / reload / 回滚流程）。 |
 | `proxyctl gui` | 启动图形界面。所有修改通过 pkexec 授权执行，成功后底部弹出提示，失败才弹窗。安装了 libadwaita（gir1.2-adw-1）时界面跟随系统深浅色和强调色。 |
@@ -688,6 +692,10 @@ GUI 的“联网进程”表还会把最近 5 分钟内出现过外网连接、�
 `--quiet` 只输出 WARN/FAIL；`--notify` 在有 FAIL 时调用 notify-send；`--basic` 只检查 dae、端口、代理核心和代理链路。
 定时器每 15 秒运行一次 `--basic`：链路正常时每 2 分钟才真正探测一次（`chain_interval`），
 探测失败后每 15 秒复查，以便尽快确认故障或恢复。GUI 顶栏的“链路”指示灯读取定时器的结果，自己不发请求。
+
+每次真正发出的链路探测都会记下时间、是否成功、耗时和当时监听 SOCKS 端口的进程（xray / sing-box / mihomo），
+追加到 `~/.local/state/proxyctl/chain-history.jsonl`（重启后仍在，只保留最近 7 天，一般不超过几百 KB）。
+`proxyctl history` 和 GUI 的延迟页读取这份记录。以 root 运行 check 时不记录。
 
 ### test 自检
 
