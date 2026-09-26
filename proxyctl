@@ -24,7 +24,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 AUTHOR = "atmago"
 HOMEPAGE = "https://github.com/atmago/dae-proxyctl"
 # “关于”窗口“法律信息”页的许可证说明（替换 libadwaita 默认的“本程序不作任何担保”那句）
