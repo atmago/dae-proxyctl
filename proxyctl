@@ -15,6 +15,7 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -38,7 +39,7 @@ LICENSE_MARKUP = '本程序遵循 MIT 许可证，详情请见 <a href="%s/blob/
 # /etc/proxyctl.conf 中允许设置的项（键名 = 环境变量名去掉 PROXYCTL_ 前缀后转小写）。
 # sudo、pkexec 和 systemd 定时器都会丢掉环境变量，所以用户设置要写在这个文件里。
 CONF_KEYS = ("socks", "config", "service", "iface", "test_url", "probe_url", "slow_seconds",
-             "connect_slow", "test_retries", "chain_interval", "gui_recent")
+             "connect_slow", "test_retries", "chain_interval", "gui_recent", "fallback_proxy")
 _conf_cache = {}
 
 
@@ -2969,15 +2970,22 @@ def proxy_ready():
     return True, None
 
 
+def fallback_ready():
+    """备用方案只依赖代理端口，不管 dae 是否在运行。"""
+    if not socks_listening():
+        return False, "代理端口 %s 未在监听（xray/v2rayN 未运行？）" % socks_str()
+    return True, None
+
+
 def cmd_run(args):
     cmd = list(args.command)
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd:
-        raise ProxyctlError("用法：proxyctl run [--wait N] -- <命令...>")
+        raise ProxyctlError("用法：proxyctl run [--fallback] [--wait N] -- <命令...>")
     deadline = time.monotonic() + max(0, args.wait)
     while True:
-        ok, reason = proxy_ready()
+        ok, reason = fallback_ready() if args.fallback else proxy_ready()
         if ok:
             break
         if time.monotonic() >= deadline:
@@ -2986,6 +2994,11 @@ def cmd_run(args):
             notify("proxyctl：已阻止启动", msg)
             return 1
         time.sleep(1)
+    if args.fallback:
+        url = fallback_proxy_url()
+        os.environ.update(fallback_env(url))
+        if is_chromium(resolve_exe(cmd[0])):
+            cmd = cmd[:1] + chromium_flags(url) + cmd[1:]
     try:
         os.execvp(cmd[0], cmd)
     except OSError as e:
@@ -3099,6 +3112,492 @@ def cmd_guard_desktop(args):
     _atomic_write_text(target, new)
     print("已生成 %s（来源：%s），启动时会先确认 dae 与 %s 可用（最多等待 30 秒）。" % (target, src, socks_str()))
     print("撤销：proxyctl guard-desktop %s --undo" % name)
+    return 0
+
+
+# -- fallback：备用方案（程序自己连代理端口，绕过 dae）---------------------------
+#
+# dae 本身出 bug 时（例如 netkit 模式下连接被重置），让单个程序通过自己的代理设置直接连
+# SOCKS/HTTP 混合端口。连向 127.0.0.1 的连接 dae 不处理，所以 dae 可以照常运行，
+# 名单中的 pname 规则保留作兜底。只改当前用户的文件，不需要 root，也不 reload dae。
+
+FALLBACK_KEY = "X-Proxyctl-Fallback"
+FALLBACK_ORIG = ".proxyctl-fallback-orig"
+FALLBACK_MARK = "PROXYCTL_FALLBACK"
+FALLBACK_NO_PROXY = "localhost,127.0.0.1,::1"
+GENERATED_KEY_RE = re.compile(r"^X-[A-Za-z0-9]+-Generated\s*=", re.I)
+CHROMIUM_FILES = ("chrome_100_percent.pak", "resources.pak", "v8_context_snapshot.bin")
+CLAUDE_CODE = "claude"  # Claude Code 读 ~/.claude/settings.json 的 env，不需要启动器
+
+
+def fallback_proxy_url():
+    return _env("PROXYCTL_FALLBACK_PROXY", "http://" + socks_str())
+
+
+def claude_settings_path():
+    return _env("PROXYCTL_CLAUDE_SETTINGS", os.path.join(os.path.expanduser("~"), ".claude", "settings.json"))
+
+
+def fallback_env(url):
+    env = {FALLBACK_MARK: "1", "NO_PROXY": FALLBACK_NO_PROXY, "no_proxy": FALLBACK_NO_PROXY}
+    for k in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+        env[k] = url
+    return env
+
+
+def resolve_exe(cmd):
+    p = cmd if "/" in cmd else shutil.which(cmd)
+    return os.path.realpath(p) if p and os.path.exists(p) else None
+
+
+def is_chromium(path):
+    """Electron / Chromium 程序在 GNOME 下读系统代理，不认环境变量，要加 --proxy-server。"""
+    d = os.path.dirname(path or "")
+    return bool(d) and any(os.path.isfile(os.path.join(d, f)) for f in CHROMIUM_FILES)
+
+
+def chromium_flags(url):
+    return ["--proxy-server=" + url, "--proxy-bypass-list=" + FALLBACK_NO_PROXY.replace(",", ";")]
+
+
+def fallback_exec_prefix():
+    return "%s run --fallback --wait 30 --" % self_bin()
+
+
+def exec_argv(value):
+    """Exec= 的值 → 实际命令（去掉 proxyctl run 前缀和 env 变量赋值）。"""
+    try:
+        argv = shlex.split(value)
+    except ValueError:
+        return []
+    if argv and os.path.basename(argv[0]) == "proxyctl" and "--" in argv:
+        argv = argv[argv.index("--") + 1:]
+    if argv and os.path.basename(argv[0]) == "env":
+        argv = argv[1:]
+        while argv and argv[0].startswith("-"):
+            argv = argv[1:]
+    while argv and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[0]):
+        argv = argv[1:]
+    return argv
+
+
+def exe_matches(path, name):
+    """启动器的程序是不是这个进程名：文件名相同，或者是同目录下同名程序的启动脚本
+    （ChatGPT 的 codex-launcher 就是 exec 同目录的 ChatGPT）。"""
+    short = name[:COMM_MAX]
+    if os.path.basename(path)[:COMM_MAX] == short:
+        return True
+    cand = os.path.join(os.path.dirname(path), name)
+    if not (os.path.isfile(cand) and os.access(cand, os.X_OK)):
+        return False
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8192)
+    except OSError:
+        return False
+    # 必须是短小的脚本，并且确实调用了这个程序（/usr/bin 里别的脚本不能因为同目录有它就算数）
+    text = head.decode("utf-8", "replace")
+    return head.startswith(b"#!") and bool(re.search(r"[/\"'\s]%s[\"'\s]" % re.escape(name), text))
+
+
+def desktop_section(text, section="Desktop Entry"):
+    """{键: 值}，只取指定分组。"""
+    out, cur = {}, None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            cur = s[1:-1]
+        elif cur == section and "=" in s and not s.startswith("#"):
+            k, _, v = s.partition("=")
+            out.setdefault(k.strip(), v.strip())
+    return out
+
+
+def _read_text(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def desktop_files():
+    """{desktop id: 实际生效的文件路径}；用户目录优先于系统目录（与桌面环境一致）。"""
+    found = {}
+    for d in [user_apps_dir()] + system_apps_dirs():
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in names:
+            if n.endswith(".desktop") and n not in found and os.path.isfile(os.path.join(d, n)):
+                found[n] = os.path.join(d, n)
+    return found
+
+
+def fallback_launchers_on():
+    """{进程名: [desktop id, ...]}：用户目录中由 fallback 生成的启动器。"""
+    out = {}
+    d = user_apps_dir()
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return out
+    for n in names:
+        if not n.endswith(".desktop"):
+            continue
+        name = desktop_section(_read_text(os.path.join(d, n)) or "").get(FALLBACK_KEY)
+        if name:
+            out.setdefault(name, []).append(n)
+    return out
+
+
+def find_launchers(name):
+    """代理名单中的进程名 → 启动它的 desktop id 列表。"""
+    ids = []
+    for did, path in desktop_files().items():
+        entry = desktop_section(_read_text(path) or "")
+        if entry.get(FALLBACK_KEY):
+            if entry[FALLBACK_KEY] == name:
+                ids.append(did)
+            continue
+        argv = exec_argv(entry.get("Exec", ""))
+        exe = resolve_exe(argv[0]) if argv else None
+        if exe and exe_matches(exe, name):
+            ids.append(did)
+    return ids
+
+
+def fallback_text(text, name):
+    prefix = fallback_exec_prefix()
+    guard = guard_exec_prefix()
+    out = []
+    for line in text.splitlines(True):
+        body = line.rstrip("\r\n")
+        end = line[len(body):]
+        s = body.strip()
+        # 去掉启动守卫标记和“由程序自动生成”标记：Claude Desktop 每次启动都会覆盖带
+        # X-Claude-Generated=true 的用户启动器，去掉后它会保留我们的文件
+        if s == GUARD_KEY or s.startswith(FALLBACK_KEY + "=") or GENERATED_KEY_RE.match(s):
+            continue
+        m = re.match(r"^Exec\s*=\s*(.*)$", body)
+        if m:
+            v = m.group(1)
+            for p in (prefix, guard):
+                if v.startswith(p + " "):
+                    v = v[len(p) + 1:]
+            line = "Exec=%s %s%s" % (prefix, v, end)
+        out.append(line)
+        if s == "[Desktop Entry]":
+            out.append("%s=%s%s" % (FALLBACK_KEY, name, end or "\n"))
+    return "".join(out)
+
+
+def launcher_on(name, did):
+    target = os.path.join(user_apps_dir(), did)
+    orig = target + FALLBACK_ORIG
+    cur = _read_text(target)
+    if cur is not None and desktop_section(cur).get(FALLBACK_KEY):
+        return "%s 已经是备用启动器。" % target
+    if cur is not None:
+        shutil.copy2(target, orig)
+        src, text = target, cur
+    else:
+        src = next((os.path.join(d, did) for d in system_apps_dirs()
+                    if os.path.isfile(os.path.join(d, did))), None)
+        text = _read_text(src) if src else None
+        if text is None:
+            raise ProxyctlError("读取不到 %s。" % did)
+    if re.search(r"^DBusActivatable\s*=\s*true", text, re.M | re.I):
+        print("警告：%s 声明了 DBusActivatable=true，桌面环境可能绕过 Exec= 直接启动它。" % did)
+    _atomic_write_text(target, fallback_text(text, name))
+    return "已生成备用启动器 %s（来源：%s）。" % (target, src)
+
+
+def launcher_off(did):
+    target = os.path.join(user_apps_dir(), did)
+    orig = target + FALLBACK_ORIG
+    cur = _read_text(target)
+    if cur is None or not desktop_section(cur).get(FALLBACK_KEY):
+        return None
+    if os.path.exists(orig):
+        os.replace(orig, target)
+        return "已恢复原来的 %s。" % target
+    os.unlink(target)
+    return "已删除备用启动器 %s，恢复使用系统自带的启动器。" % target
+
+
+def load_claude_settings():
+    path = claude_settings_path()
+    text = _read_text(path)
+    if text is None:
+        if os.path.exists(path):
+            raise ProxyctlError("无法读取 %s。" % path)
+        return {}
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except ValueError as e:
+        raise ProxyctlError("%s 不是合法的 JSON（%s），为避免破坏它，未做修改。" % (path, e))
+    if not isinstance(data, dict) or not isinstance(data.get("env", {}), dict):
+        raise ProxyctlError("%s 的结构不是预期的格式，未做修改。" % path)
+    return data
+
+
+def claude_fallback_url(data=None):
+    """Claude Code 设置里的代理地址，没有设置时为 None。"""
+    env = (load_claude_settings() if data is None else data).get("env", {})
+    return env.get("HTTPS_PROXY") or env.get("HTTP_PROXY") or None
+
+
+def save_claude_settings(data):
+    path = claude_settings_path()
+    mode = 0o600
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        pass
+    _atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n", mode)
+
+
+def claude_on(url):
+    data = load_claude_settings()
+    env = data.setdefault("env", {})
+    if env.get("HTTPS_PROXY") == url and env.get("HTTP_PROXY") == url:
+        return "Claude Code 已经在走备用方案（%s 中已设置代理）。" % claude_settings_path()
+    env["HTTPS_PROXY"] = env["HTTP_PROXY"] = url
+    env.setdefault("NO_PROXY", FALLBACK_NO_PROXY)
+    save_claude_settings(data)
+    return "已在 %s 中设置 HTTPS_PROXY / HTTP_PROXY = %s。" % (claude_settings_path(), url)
+
+
+def claude_off():
+    data = load_claude_settings()
+    env = data.get("env", {})
+    if not (env.get("HTTPS_PROXY") or env.get("HTTP_PROXY")):
+        return None
+    old = env.pop("HTTPS_PROXY", None) or env.pop("HTTP_PROXY", None)
+    env.pop("HTTP_PROXY", None)
+    if env.get("NO_PROXY") == FALLBACK_NO_PROXY:
+        del env["NO_PROXY"]
+    if not env:
+        data.pop("env", None)
+    save_claude_settings(data)
+    return "已从 %s 中删除代理设置（原来是 %s）。" % (claude_settings_path(), old)
+
+
+def proc_environ(pid):
+    try:
+        with open(os.path.join(proc_dir(), str(pid), "environ"), "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    return dict(kv.decode("utf-8", "replace").partition("=")[::2] for kv in data.split(b"\0") if kv)
+
+
+def proc_uses_fallback(pid):
+    """这个进程是不是按备用方案启动的；读不到时为 None。
+
+    Chromium / Electron 设置进程标题时会覆盖 /proc/PID/environ 所在的内存（读出来全是空），
+    所以还要看命令行里有没有 --proxy-server。"""
+    env = proc_environ(pid)
+    try:
+        with open(os.path.join(proc_dir(), str(pid), "cmdline"), "rb") as f:
+            argv = f.read().split(b"\0")
+    except OSError:
+        argv = None
+    if env is None and argv is None:
+        return None
+    if env and env.get(FALLBACK_MARK) == "1":
+        return True
+    return any(a.startswith(b"--proxy-server=") for a in argv or [])
+
+
+def socks_conns(name, conns):
+    """(连 SOCKS/HTTP 端口的连接数, 直接连外网的连接数)：后者是经 dae 转发的。"""
+    host, port = socks_addr()
+    local = ext = 0
+    for c in conns or []:
+        if not any(n[:COMM_MAX] == name[:COMM_MAX] for n, _ in c["procs"]):
+            continue
+        if c["peer_ip"] is not None and c["peer_ip"].is_loopback and c["peer_port"] == str(port):
+            local += 1
+        elif not is_local_ip(c["peer_ip"]):
+            ext += 1
+    return local, ext
+
+
+def fallback_parent(name, table):
+    """这个进程的上层进程里，最近的一个有启动器、能开启备用的进程名（codex → ChatGPT）。"""
+    pids = [pid for pid, (comm, _) in table.items() if comm == name[:COMM_MAX]]
+    seen = set()
+    for pid in pids:
+        ppid = table[pid][1]
+        while ppid in table and ppid not in seen:
+            seen.add(ppid)
+            comm, up = table[ppid]
+            if comm != name[:COMM_MAX] and NAME_RE.fullmatch(comm) and not is_blacklisted(comm):
+                return comm
+            ppid = up
+    return None
+
+
+def fallback_info(name, table=None, conns=None, launchers_on=None, found=None):
+    """一个进程名的备用方案状态，GUI 和 `fallback` 都用。
+
+    method：claude-code / launcher / None；on：设置是否已开启；running：是否在运行；
+    live：正在运行的进程里有没有带备用标记（True / False / None=无法判断）；
+    local / ext：连代理端口 / 直连外网（经 dae）的连接数；parent：可改为对它开启的上层进程。
+    """
+    if table is None:
+        table = process_table()
+    if launchers_on is None:
+        launchers_on = fallback_launchers_on()
+    info = {"name": name, "method": None, "on": False, "ids": [], "running": False, "live": None,
+            "local": 0, "ext": 0, "parent": None, "error": None}
+    pids = [pid for pid, (comm, _) in table.items() if comm == name[:COMM_MAX]]
+    info["running"] = bool(pids)
+    if name == CLAUDE_CODE:
+        info["method"] = "claude-code"
+        try:
+            info["on"] = claude_fallback_url() is not None
+        except ProxyctlError as e:
+            info["error"] = str(e)
+    else:
+        on_ids = launchers_on.get(name, [])
+        if on_ids:
+            info["ids"] = on_ids
+        elif found is not None:
+            if name not in found:
+                found[name] = find_launchers(name)
+            info["ids"] = found[name]
+        else:
+            info["ids"] = find_launchers(name)
+        info["on"] = bool(on_ids)
+        if info["ids"]:
+            info["method"] = "launcher"
+        else:
+            info["parent"] = fallback_parent(name, table)
+    if pids:
+        marks = [m for m in (proc_uses_fallback(pid) for pid in pids) if m is not None]
+        if marks:
+            info["live"] = any(marks)
+    if conns is not None:
+        info["local"], info["ext"] = socks_conns(name, conns)
+    return info
+
+
+def fallback_describe(info):
+    """(状态文字, 级别 ok/warn/plain)。"""
+    if info["error"]:
+        return info["error"], "warn"
+    if info["method"] is None:
+        if info["live"]:
+            return "随上层进程走备用方案", "ok"
+        if info["parent"]:
+            return "没有启动器；它由 %s 启动，对 %s 开启备用即可（子进程会继承代理设置）" % (
+                info["parent"], info["parent"]), "plain"
+        return "找不到它的启动器，不能单独切换（如果它是别的程序启动的子进程，对那个程序开启即可）", "plain"
+    if info["method"] == "claude-code":
+        if info["on"]:
+            return "备用方案：Claude Code 直连 %s（新会话生效）" % socks_str(), "ok"
+        if info["live"]:
+            return "设置中没有开启，但它从上层程序（claude-desktop）继承了备用方案的代理设置", "ok"
+        return "经 dae", "plain"
+    if info["on"]:
+        if info["running"] and info["live"] is False:
+            return "已切到备用方案，但程序是之前启动的，重启后生效", "warn"
+        return "备用方案：直连 %s" % socks_str(), "ok"
+    if info["running"] and info["live"]:
+        return "已改回 dae，但程序仍按备用方案运行，重启后生效", "warn"
+    return "经 dae", "plain"
+
+
+def _fallback_names(args):
+    if args.all:
+        view = load_rules_view()[0] or {}
+        names = list(view.get("proxy", []))
+        if not names:
+            raise ProxyctlError("代理名单为空。")
+        return names
+    if not args.names:
+        raise ProxyctlError("请给出进程名，或使用 --all。")
+    for n in args.names:
+        validate_name(n)
+    return args.names
+
+
+def cmd_fallback(args):
+    if os.geteuid() == 0 and not os.environ.get("PROXYCTL_ALLOW_ROOT_FALLBACK"):
+        raise ProxyctlError("备用方案改的是当前用户的启动器和设置，请用普通用户运行（不要加 sudo）。")
+    if args.action == "status":
+        return fallback_status(args)
+    url = fallback_proxy_url()
+    table = process_table()
+    launchers_on = fallback_launchers_on()
+    rc = 0
+    restart = []
+    done = 0
+    for name in _fallback_names(args):
+        info = fallback_info(name, table, launchers_on=launchers_on)
+        if info["error"]:
+            print("%s：%s" % (name, info["error"]), file=sys.stderr)
+            rc = 1
+            continue
+        if info["method"] is None:
+            print("%s：%s。" % (name, fallback_describe(info)[0]), file=sys.stderr)
+            if not args.all:
+                rc = 1
+            continue
+        if info["method"] == "claude-code":
+            msg = claude_on(url) if args.action == "on" else claude_off()
+            done += 1
+            print("%s：%s" % (name, msg or "没有开启备用方案，无需改回。"))
+            if msg and info["running"]:
+                print("    正在运行的会话不受影响，新开的会话才会%s。"
+                      % ("直连代理端口" if args.action == "on" else "改回经 dae"))
+            continue
+        changed = False
+        done += 1
+        for did in info["ids"]:
+            msg = launcher_on(name, did) if args.action == "on" else launcher_off(did)
+            if msg:
+                print("%s：%s" % (name, msg))
+                changed = changed or "已经是" not in msg
+        if args.action == "off" and not changed:
+            print("%s：没有开启备用方案，无需改回。" % name)
+        if changed and info["running"]:
+            restart.append(name)
+    if restart:
+        print("\n需要完全退出并重新启动这些程序才会生效：%s" % "、".join(restart))
+        print("（Electron 程序关窗口后常驻托盘，请从托盘菜单退出；启动时会按新的方式连接）")
+    if args.action == "on" and done:
+        print("\n备用方案：程序自己连 %s，不经过 dae；dae 中的规则保留作兜底。"
+              "\n代理端口不可用时这些程序会连不上，不会退回直连。" % url)
+    return rc
+
+
+def fallback_status(args):
+    view = load_rules_view()[0] or {}
+    names = list(args.names or view.get("proxy", []))
+    on = fallback_launchers_on()
+    names += [n for n in on if n not in names]
+    if not names:
+        print("代理名单为空。")
+        return 0
+    ptable = process_table()
+    conns = raw_connections()
+    rows = []
+    for n in names:
+        info = fallback_info(n, ptable, conns, on)
+        text, _ = fallback_describe(info)
+        via = "-"
+        if info["local"] or info["ext"]:
+            via = "代理端口 %d / 经 dae %d" % (info["local"], info["ext"])
+        how = {"claude-code": "Claude Code 设置", "launcher": "启动器 " + "、".join(info["ids"])}.get(
+            info["method"], "-")
+        rows.append([n, "运行中" if info["running"] else "未运行", how, via, text])
+    print(table(["进程名", "状态", "切换方式", "当前连接", "说明"], rows))
+    print("\n切到备用：proxyctl fallback on <进程名>；改回 dae：proxyctl fallback off <进程名>")
     return 0
 
 
@@ -3348,6 +3847,8 @@ GUI_CSS = """
 # 特权操作成功后的提示（toast）
 GUI_DONE = {"add": "已加入代理名单", "remove": "已从代理名单移除", "protect": "已加入直连保护",
             "unprotect": "已取消直连保护", "restore": "已恢复备份", "import": "已导入规则"}
+GUI_FALLBACK_TIP = {"launcher": "需要完全退出（包括托盘）并重新启动这个程序才会生效。",
+                    "claude-code": "改的是 ~/.claude/settings.json，新开的会话生效。"}
 GUI_DNS_TAG = {"ok": "tag-dns-ok", "warn": "tag-child", "plain": "tag-default"}
 GUI_TAG = {STATUS_PROXY: "tag-proxy", STATUS_DIRECT: "tag-direct", STATUS_CHILD: "tag-child"}
 
@@ -3372,6 +3873,7 @@ class ProxyctlGui(object):
         self.dump = []  # PROXYCTL_GUI_DUMP：测试时导出每行的按钮状态
         self.view = None
         self.procs_running = {}
+        self.launcher_cache = (0.0, {})  # 进程名 → 启动器，扫描所有 .desktop 文件较慢，缓存 60 秒
         self.alert = False
         self.chooser = None
         self.chain_sig = None
@@ -4142,6 +4644,7 @@ class ProxyctlGui(object):
 
     def force_refresh(self):
         self.proc_sig = self.rules_sig = self.hero_sig = self.dns_sig = self.chain_sig = None
+        self.launcher_cache = (0.0, {})
         self.resolver_cache = (0.0, None)
         self.refresh()
 
@@ -4338,11 +4841,29 @@ class ProxyctlGui(object):
         if self.ver == 3:
             box.show_all()
 
+    def fallback_infos(self, names):
+        """代理名单中每个程序的备用方案状态（不跑 ss，只看设置和进程）。"""
+        t, found = self.launcher_cache
+        if time.time() - t > 60:
+            found = {}
+            self.launcher_cache = (time.time(), found)
+        table = process_table()
+        on = fallback_launchers_on()
+        out = {}
+        for n in names:
+            try:
+                out[n] = fallback_info(n, table, launchers_on=on, found=found)
+            except Exception:  # noqa  状态读不到不影响规则页
+                pass
+        return out
+
     def refresh_rules(self, view, note):
         running = self.procs_running
+        fb = self.fallback_infos((view or {}).get("proxy", []))
         sig = (json.dumps(view, sort_keys=True, default=str), note,
                sorted(n for n in (view or {}).get("proxy", []) + (view or {}).get("direct", [])
-                      if n[:COMM_MAX] in running))
+                      if n[:COMM_MAX] in running),
+               sorted((n, i["method"], i["on"], i["live"], i["error"]) for n, i in fb.items()))
         if sig == self.rules_sig:
             return
         self.rules_sig = sig
@@ -4357,7 +4878,8 @@ class ProxyctlGui(object):
             self.row(lb, "配置尚未初始化", "请在终端执行 sudo proxyctl init")
         reload_tip = "修改名单后 dae 会重新加载，正在走代理的程序会短暂断线并自动重连。"
         for title, key, cmd, desc in (
-                ("代理名单", "proxy", "remove", "这些程序的所有连接经 dae 转给 %s。" % socks_str()),
+                ("代理名单", "proxy", "remove", "这些程序的所有连接经 dae 转给 %s。"
+                 "dae 出问题时，可以把单个程序切到“备用”：它自己直连 %s，不经过 dae。" % (socks_str(), socks_str())),
                 ("直连保护", "direct", "unprotect", "这些程序永远直连，即使以后改了默认规则。")):
             names = view.get(key, [])
             lb = self.group(box, title, len(names), desc)
@@ -4373,7 +4895,26 @@ class ProxyctlGui(object):
                     sub += '　<span foreground="%s">⚠ 超过 15 个字符，可能不会命中</span>' % GUI_DOT["warn"]
                     tip = long_name_warning(name)
                 rm = self.button("移除", self.priv, [cmd, name], tooltip=reload_tip)
-                self.row(lb, name, sub, suffix=[rm], sub_markup=True, tip=tip)
+                suffix = [rm]
+                info = fb.get(name) if key == "proxy" else None
+                if info:
+                    text, level = fallback_describe(info)
+                    if info["on"] or info["live"] or level == "warn":
+                        sub += '　<span foreground="%s">%s</span>' % (
+                            GUI_DOT["ok" if level == "ok" else "warn"], self.GLib.markup_escape_text(text))
+                    if info["method"]:
+                        if info["on"]:
+                            fbtn = self.button("改回 dae", self.user_run, ["fallback", "off", name],
+                                               tooltip="恢复经 dae 分流。" + GUI_FALLBACK_TIP[info["method"]])
+                        else:
+                            fbtn = self.button("备用", self.user_run, ["fallback", "on", name],
+                                               tooltip="dae 出问题时使用：让这个程序自己直连 %s，不经过 dae；"
+                                                       "dae 中的规则保留作兜底。不需要授权。%s"
+                                                       % (socks_str(), GUI_FALLBACK_TIP[info["method"]]))
+                        suffix = [fbtn, rm]
+                    elif not tip:
+                        tip = text
+                self.row(lb, name, sub, suffix=suffix, sub_markup=True, tip=tip)
         safety = view.get("safety", [])
         lb = self.group(box, "固定规则", len(safety), "由 proxyctl 维护：代理核心自身必须直连，自检探针走代理。不能删除。")
         for n, o in safety:
@@ -4473,7 +5014,11 @@ class ProxyctlGui(object):
             return
         self.priv([sub, name])
 
-    def priv(self, subargs):
+    def user_run(self, subargs):
+        """不需要 root 的操作（备用方案），以当前用户身份执行。"""
+        self.priv(subargs, root=False)
+
+    def priv(self, subargs, root=True):
         if self.busy:
             return
         exe = self_bin()
@@ -4482,8 +5027,12 @@ class ProxyctlGui(object):
             return
         self.busy = True
         self.content.set_sensitive(False)
-        self.set_status("等待授权：proxyctl %s" % " ".join(subargs), busy=True)
-        cmd = [pkexec_bin(), exe] + subargs
+        if root:
+            self.set_status("等待授权：proxyctl %s" % " ".join(subargs), busy=True)
+            cmd = [pkexec_bin(), exe] + subargs
+        else:
+            self.set_status("正在执行：proxyctl %s" % " ".join(subargs), busy=True)
+            cmd = [exe] + subargs
 
         def work():
             rc, out = run_cmd(cmd, timeout=300)
@@ -4504,6 +5053,12 @@ class ProxyctlGui(object):
                 self.entry.set_text("")
             if subargs[0] == "dns":
                 msg = "已%s DNS 防泄漏" % ("开启" if subargs[-1] == "on" else "关闭")
+            elif subargs[0] == "fallback":
+                msg = "%s %s" % (subargs[2], "已切到备用方案" if subargs[1] == "on" else "已改回经 dae")
+                if "重新启动" in out:
+                    msg += "，重启该程序后生效"
+                elif "新开的会话" in out:
+                    msg += "，新会话生效"
             else:
                 msg = "%s：%s" % (GUI_DONE.get(subargs[0], "已完成"), " ".join(subargs[1:]))
             if "重新加载" in out:
@@ -4771,7 +5326,14 @@ def build_parser():
     sub.add_parser("test", help="端到端自检")
     sp = sub.add_parser("run", help="确认代理可用后再启动程序")
     sp.add_argument("--wait", type=int, default=0, metavar="N", help="最多等待 N 秒")
+    sp.add_argument("--fallback", action="store_true",
+                    help="备用方案：只要求代理端口可用，并让程序通过环境变量 / --proxy-server 直接连它")
     sp.add_argument("command", nargs=argparse.REMAINDER, help="-- 之后的命令")
+    sp = sub.add_parser("fallback", help="备用方案：让单个程序绕过 dae、直接连代理端口（不需要 root）")
+    sp.add_argument("action", choices=("on", "off", "status"),
+                    help="on = 切到备用方案；off = 改回经 dae；status = 查看各程序当前走哪条路")
+    sp.add_argument("names", nargs="*", metavar="进程名", help="代理名单中的进程名，可以写多个")
+    sp.add_argument("--all", action="store_true", help="对代理名单中的所有程序操作")
     sp = sub.add_parser("guard-desktop", help="为 .desktop 启动器生成带启动守卫的覆盖副本")
     sp.add_argument("desktop", help="desktop 文件名，例如 signal-desktop.desktop")
     sp.add_argument("--undo", action="store_true", help="撤销")
@@ -4800,6 +5362,7 @@ HANDLERS = {
     "check": cmd_check, "test": cmd_test, "run": cmd_run, "guard-desktop": cmd_guard_desktop,
     "backups": cmd_backups, "restore": cmd_restore, "gui": cmd_gui,
     "export": cmd_export, "import": cmd_import, "dns": cmd_dns, "history": cmd_history,
+    "fallback": cmd_fallback,
 }
 WRITE_CMDS = {"init", "add", "remove", "protect", "unprotect", "restore", "import"}
 

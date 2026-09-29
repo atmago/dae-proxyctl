@@ -253,6 +253,48 @@
 51r. 推演 DNS 走向时会计算单独的 `dip(...) -> 出口` 规则（只认 IP / CIDR，geoip 等不推演），因此开启防泄漏后 DNS 标签显示“DNS 代理”。
     DNS 走代理时标签不再区分明文和加密：查询在代理隧道里，对运营商来说都不可见。
 
+## 备用方案（fallback）
+
+51s. 起因：dae 2.1.1 netkit 模式下，claude 到 api.anthropic.com 的 IPv4 连接频繁被重置（疑似 daeuniverse/dae#1078），
+    而 xray 和节点都正常。dae 只负责“把程序的流量交给代理端口”，这一层坏了时，让程序自己连代理端口即可绕过；
+    节点或内核的问题（慢、不通）绕过 dae 也没用，应该在 v2rayN 里换节点，所以备用方案不处理这种情况。
+51t. **按程序切换，而不是整体切换**：dae 的 bug 往往只影响个别程序（上面的例子只有 claude 受影响），
+    整体切换会让其他正常的程序也要重启、也失去 dae 的兜底。`--all` 只是逐个执行的快捷方式。
+51u. **dae 保持运行、规则不动**：连向 127.0.0.1 的连接 dae 不处理，两条路互不干扰；程序没有按代理设置走的连接
+    （例如不认环境变量的子进程）仍会被 dae 的 pname 规则接住。因此切换不需要 root、不写 dae 配置、不 reload
+    （reload 会断开所有代理连接，而 dae 出问题时 reload 本身也可能失败）。
+51v. **不自动切换**：Electron 程序只在启动时读取 `--proxy-server`，切换后必须重启程序；自动重启用户的程序风险太大。
+    状态只在 `fallback status` 和 GUI 中显示，是否切换由用户决定。
+51w. **切换方式按程序而定**：
+    - 进程名 `claude` 固定视为 Claude Code，改 `~/.claude/settings.json` 的 `env.HTTPS_PROXY / HTTP_PROXY / NO_PROXY`。
+      只增删这三个键，其他内容（hooks 等）原样保留，文件权限不变；JSON 不合法时拒绝修改。
+      改回时 `NO_PROXY` 只在等于 proxyctl 写入的默认值时删除。
+    - 其他程序找启动它的 .desktop 文件：Exec 的程序（去掉 proxyctl run 前缀和 env 赋值、按 PATH 解析、跟随符号链接）
+      文件名等于进程名，或者是一个短小的脚本、同目录有同名可执行文件并且脚本里确实写了这个名字
+      （ChatGPT 的 `codex-launcher` 就是 `exec 同目录/ChatGPT`）。只要求“同目录有同名文件”会误匹配 /usr/bin 里的其他脚本。
+    - 都找不到时不能单独切换；如果它是某个程序的子进程（从进程树找最近的上层），提示对上层程序开启，
+      环境变量会被子进程继承（codex 认 HTTPS_PROXY，已在 2026-09-26 验证）。
+51x. **启动器**：与 guard-desktop 相同，写到 `~/.local/share/applications/<同名>.desktop` 覆盖系统启动器，
+    每个 Exec 改为 `proxyctl run --fallback --wait 30 -- 原命令`，并加 `X-Proxyctl-Fallback=<进程名>` 标记。
+    用户目录中原来就有同名文件（guard-desktop 生成的、用户自己改的、程序自动生成的）时，先另存为 `.proxyctl-fallback-orig`，
+    改回时原样恢复；原来没有时改回就删除。生成时去掉 `X-Proxyctl-Guarded` 和 `X-*-Generated=true`：
+    Claude Desktop 每次启动都会重写带 `X-Claude-Generated=true` 的用户启动器（源码中遇到不带这个标记的用户文件会跳过），
+    去掉后备用启动器才不会被覆盖。
+51y. **`run --fallback`** 只检查代理端口在监听，不检查 dae；端口不通时同样等待、拒绝启动并弹通知。
+    注入 `HTTPS_PROXY / HTTP_PROXY`（大小写两套）、`NO_PROXY`（本机地址）和标记 `PROXYCTL_FALLBACK=1`；
+    程序所在目录有 `chrome_100_percent.pak`、`resources.pak` 或 `v8_context_snapshot.bin` 时视为 Chromium / Electron，
+    在第一个参数前插入 `--proxy-server=<地址> --proxy-bypass-list=localhost;127.0.0.1;::1`。
+    地址默认 `http://<socks 地址>`：v2rayN 的 10808 是 socks + http 混合端口；用 HTTP 代理时域名由代理端解析，本地 DNS 污染不影响。
+    代理端口断开时，这些程序连不上，不会退回直连。
+51z. **判断程序是否正在按备用方案运行**：Chromium 设置进程标题时会覆盖 `/proc/PID/environ` 所在的内存（实测读出来全是空字符），
+    所以除了环境变量里的标记，还看命令行中有没有 `--proxy-server=`。`fallback status` 另外用 ss 统计每个程序连代理端口
+    和直连外网（即经 dae）的连接数，作为实际走向的依据。Claude Code 的设置是进程启动后才读的，环境变量里看不到，
+    只能靠连接数判断；它从切到备用的 claude-desktop 继承代理环境变量时也会显示出来。
+51za. GUI 中“备用 / 改回 dae”以当前用户身份执行（不经 pkexec）。查找启动器要扫描所有 .desktop 文件，结果缓存 60 秒；
+    规则页每 3 秒刷新时只读进程表和用户启动器目录，不执行 ss。
+51zb. fallback 拒绝以 root 运行：它改的是当前用户的文件，sudo 下 HOME 可能指向 /root。
+    实测（临时 HOME 中另起一个 Signal）：带 `--proxy-server` 启动后，它的全部连接都连向 127.0.0.1:10808。
+
 ## 测试
 
 52. 真实 `dae validate`：非 root 下可以执行（已验证），因此作为测试的一部分；若将来在没有 dae 的机器上运行，该组测试自动跳过。
