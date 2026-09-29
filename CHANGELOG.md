@@ -2,6 +2,29 @@
 
 每个版本发布时，GitHub Releases 页面会自动使用这里对应版本的内容作为说明。
 
+## 未发布
+
+### 新增
+
+- **备用方案（按程序切换）**：dae 本身出问题时（例如 dae 2.1.1 netkit 模式下连接频繁被重置），
+  可以把单个程序切到“备用”：它自己直连代理端口（默认 `http://127.0.0.1:10808`），不经过 dae。
+  `proxyctl fallback on|off <进程名...>`（或 `--all`），`proxyctl fallback status` 用 ss 实测每个程序的连接
+  是连代理端口还是经 dae。不需要 root，不修改 dae 配置，也不 reload dae；名单中的 pname 规则保留作兜底。
+  - 桌面程序：在 `~/.local/share/applications/` 生成启动器，经 `proxyctl run --fallback` 启动，注入代理环境变量；
+    Electron / Chromium 程序另加 `--proxy-server`（在 GNOME 下它们只认系统代理，不认环境变量）。改回时原样恢复原来的启动器。
+  - Claude Code（进程名 `claude`）：改 `~/.claude/settings.json` 的 `env`，新开的会话生效，不用重启 Claude Desktop。
+  - 没有启动器的子进程（如 ChatGPT 启动的 codex）提示对上层程序开启，子进程会继承代理设置。
+- GUI“规则”页：代理名单每一行显示当前走 dae 还是备用方案，并有“备用 / 改回 dae”按钮（不弹授权框）；
+  已切换但程序还是旧方式运行时提示重启。
+- `proxyctl run --fallback`：只要求代理端口在监听（不管 dae 是否在运行），然后按备用方案启动程序。
+- 配置项 `fallback_proxy`：备用方案使用的代理地址。
+
+### 文档
+
+- README 改为简版首页（图标、特性、快速开始），软件名统一写作 **Proxyctl**（命令仍是小写的 `proxyctl`）。
+- 新增 [安装教程](docs/INSTALL.md)：面向新手，从零开始，每一步都写明成功的样子和失败时怎么办。
+- 新增 [使用手册](docs/MANUAL.md)：日常使用、常见问题、故障模式、备用方案、全部命令和配置项。
+
 ## v1.2.0 — 2026-09-26
 
 ### 新增
