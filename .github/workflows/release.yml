@@ -49,5 +49,5 @@ jobs:
             fi
             flag="--latest=false"
             [ "$tag" = "$latest" ] && flag="--latest"
-            gh release create "$tag" --title "proxyctl $tag" --notes-file notes.md --verify-tag $flag
+            gh release create "$tag" --title "Proxyctl $tag" --notes-file notes.md --verify-tag $flag
           done
